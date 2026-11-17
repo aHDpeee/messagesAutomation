@@ -1,8 +1,7 @@
 """Clearly marked attribution in exported files."""
 
 TEXT = "Exported with Signal Archive by ahdpeee and Codex. Ideas and contributions welcome."
-# Set this to the actual public repository URL after the repository is created.
-REPOSITORY_URL = ""
+REPOSITORY_URL = "https://github.com/aHDpeee/messagesAutomation"
 
 
 def text() -> str:
