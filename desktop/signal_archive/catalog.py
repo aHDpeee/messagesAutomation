@@ -1,7 +1,10 @@
-"""Chat metadata, user-defined blocks, and readable catalog exports.
+"""Chat metadata, user-defined groups, and the readable CSV catalog.
 
-The state dictionary remains authoritative. CSV is an atomic, readable snapshot;
-it is not read back as configuration and never contains Telegram credentials.
+The CSV is the human-editable settings file: external edits are validated and
+adopted, then written back as a canonical snapshot. Dates are always stored as
+ISO 8601 in the application state and in the CSV; common spreadsheet date
+formats are accepted when the CSV is read. Telegram credentials are never
+included.
 """
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ import re
 import tempfile
 import uuid
 from . import attribution
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +39,65 @@ def _name(name: str) -> str:
     if not name or len(name) > 100 or any(ord(c) < 32 for c in name):
         raise ValueError("Block name must contain 1–100 printable characters.")
     return name
+
+
+_DATE_FIELDS = ("added_at", "last_message_date", "members_exported_at")
+
+# Spreadsheet applications rewrite ISO timestamps into local display formats.
+# Accept the common M/D/Y form (with optional 12/24-hour time) and a year-first
+# variant, then store a single canonical ISO value everywhere in the app.
+_TIME_PART = r"(?:[ T]+(?P<hour>0?\d|1\d|2[0-3]):(?P<minute>[0-5]\d)(?::(?P<second>[0-5]\d))?(?:\.(?P<fraction>\d{1,6}))?\s*(?P<ampm>[AaPp][Mm])?)?"
+_SLASH_DATE = re.compile(r"(?P<month>0?[1-9]|1[0-2])/(?P<day>0?[1-9]|[12]\d|3[01])/(?P<year>\d{2}|\d{4})" + _TIME_PART + r"$")
+_DASH_DATE = re.compile(r"(?P<year>\d{4})-(?P<month>0?[1-9]|1[0-2])-(?P<day>0?[1-9]|[12]\d|3[01])" + _TIME_PART + r"$")
+# An unformatted spreadsheet cell can also contain the raw Excel serial number.
+_EXCEL_SERIAL = re.compile(r"(?P<whole>[1-9]\d{4})(?:\.(?P<fraction>\d+))?$")
+_DATE_HINT = "use ISO (2026-11-15T04:15:00+00:00) or a spreadsheet date such as 11/15/26 4:15"
+
+
+def _date_from_parts(match: re.Match) -> str:
+    year = int(match.group("year"))
+    if year < 100:
+        year += 2000 if year < 69 else 1900
+    hour = int(match.group("hour") or 0)
+    ampm = match.group("ampm")
+    if ampm:
+        if not 1 <= hour <= 12:
+            raise ValueError("invalid 12-hour clock value")
+        hour = hour % 12 + (12 if ampm.lower() == "pm" else 0)
+    fraction = match.group("fraction") or ""
+    try:
+        value = datetime(year, int(match.group("month")), int(match.group("day")), hour,
+                         int(match.group("minute") or 0), int(match.group("second") or 0),
+                         int(fraction.ljust(6, "0")) if fraction else 0, tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ValueError("date is out of range") from exc
+    return value.isoformat()
+
+
+def _normalize_date(value: str) -> str:
+    """Return a canonical ISO date, accepting ISO and spreadsheet formats."""
+    text = value.strip()
+    if text.startswith("'"):
+        text = text[1:].strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).isoformat()
+    except ValueError:
+        pass
+    for pattern in (_SLASH_DATE, _DASH_DATE):
+        match = pattern.fullmatch(text)
+        if match:
+            return _date_from_parts(match)
+    match = _EXCEL_SERIAL.fullmatch(text)
+    if match:
+        number = float(match.group("whole") + "." + (match.group("fraction") or "0"))
+        if number < 61:
+            raise ValueError("invalid spreadsheet date serial")
+        value = datetime(1899, 12, 30, tzinfo=timezone.utc) + timedelta(days=number)
+        return value.replace(microsecond=0).isoformat()
+    raise ValueError(_DATE_HINT)
 
 
 def create_block(state: dict, name: str) -> str:
@@ -217,10 +279,12 @@ def parse_catalog(content: bytes | str, state: dict) -> dict:
         raise ValueError("Catalog is empty; refusing to erase all chats.")
     old = {str(d["id"]): d for d in state.get("dialogs", [])}
     result = copy.deepcopy(state)
-    blocks = result.setdefault("blocks", {})
-    for block in blocks.values():
-        block["chat_ids"] = []
-    names = {str(b["name"]).casefold(): ident for ident, b in blocks.items()}
+    # Keep block IDs for names that already exist, but let the CSV decide which
+    # groups exist and which chats belong to them. A group absent from the CSV
+    # is removed; a group whose chats were all removed is no longer stored.
+    previous_blocks = {str(b["name"]).casefold(): ident for ident, b in result.get("blocks", {}).items()}
+    blocks: dict[str, dict] = {}
+    names: dict[str, str] = {}
     dialogs, selected, seen = [], [], set()
 
     def unescape(value: str) -> str:
@@ -248,14 +312,13 @@ def parse_catalog(content: bytes | str, state: dict) -> dict:
             raise ValueError("A chat title cannot be empty.")
         if any(len(v) > 16_384 for v in row.values()):
             raise ValueError("A catalog field is too large.")
-        for field in ("added_at", "last_message_date", "members_exported_at"):
-            if row[field].strip():
-                try:
-                    datetime.fromisoformat(row[field].strip().replace("Z", "+00:00"))
-                except ValueError as exc:
-                    raise ValueError(f"Invalid date in {field}; use ISO format.") from exc
+        for field in _DATE_FIELDS:
+            try:
+                row[field] = _normalize_date(row[field])
+            except ValueError as exc:
+                raise ValueError(f"Invalid date in {field}; {exc}") from exc
         dialog = dict(old.get(ident, {}))
-        dialog.update({k: row[k] for k in ("title", "type", "username", "link", "description", "added_via", "added_at", "last_message_date", "members_exported_at")})
+        dialog.update({k: row[k] for k in ("title", "type", "username", "link", "description", "added_via", *_DATE_FIELDS)})
         dialog["id"] = ident
         dialog.setdefault("accessible", True)
         dialogs.append(dialog)
@@ -276,13 +339,13 @@ def parse_catalog(content: bytes | str, state: dict) -> dict:
             block_name = _name(block_name)
             key = block_name.casefold()
             if key not in names:
-                ident_block = uuid.uuid4().hex
+                ident_block = previous_blocks.get(key) or uuid.uuid4().hex
                 blocks[ident_block] = {"name": block_name, "chat_ids": []}
                 names[key] = ident_block
             block = blocks[names[key]]
             if ident not in block["chat_ids"]:
                 block["chat_ids"].append(ident)
-    result["dialogs"], result["selected"] = dialogs, selected
+    result["dialogs"], result["selected"], result["blocks"] = dialogs, selected, blocks
     return result
 
 

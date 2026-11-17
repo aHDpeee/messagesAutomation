@@ -15,20 +15,31 @@ from signal_archive.direct_service import DirectService
 
 
 class SchedulerDateIntegrationTests(unittest.TestCase):
-    def test_modified_catalog_blocks_export_until_reloaded(self):
+    def test_valid_external_catalog_edit_is_adopted_and_invalid_one_blocks_export(self):
         async def run(root):
             client = SimpleNamespace()
             service = DirectService(client, root / "state", root / "exports")
-            service.state["dialogs"] = [{"id": "1", "title": "Example"}]
+            service.state["dialogs"] = [{"id": "1", "title": "Example", "type": "chat"}]
             service.select(["1"])
             path = service.catalog_path
             altered = path.read_text(encoding="utf-8-sig").replace("Example", "Changed")
             path.write_text(altered, encoding="utf-8-sig")
+            source = root / "source.csv"
+            source.write_text("message\n", encoding="utf-8")
+            async def fake_export(*args, **kwargs):
+                return {"path": str(source), "messages": 0, "last_id": 0}
+            with patch("signal_archive.direct_service.export_chat", side_effect=fake_export) as export:
+                await service.export_selected()
+                self.assertEqual(export.call_count, 1)
+            self.assertEqual(service.state["dialogs"][0]["title"], "Changed")
+            self.assertIn("Changed", path.read_text(encoding="utf-8-sig"))
+
+            path.write_bytes(b"not a catalog\n")
             with patch("signal_archive.direct_service.export_chat") as export:
-                with self.assertRaisesRegex(ValueError, "Reload chats.csv"):
+                with self.assertRaises(ValueError):
                     await service.export_selected()
                 export.assert_not_called()
-            self.assertIn("Changed", path.read_text(encoding="utf-8-sig"))
+            self.assertEqual(path.read_bytes(), b"not a catalog\n")
         with tempfile.TemporaryDirectory() as tmp:
             asyncio.run(run(Path(tmp)))
 

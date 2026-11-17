@@ -316,6 +316,20 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("action=/select", page)
         self.assertIn("Save selection", page)
 
+    def test_only_group_checkbox_is_visible_and_export_selection_sorts_first(self):
+        self.service.state["dialogs"] = [
+            {"id": "1", "title": "Selected chat", "type": "chat", "accessible": True},
+            {"id": "2", "title": "Other chat", "type": "chat", "accessible": True},
+        ]
+        self.service.state["selected"] = ["1"]
+        page = self.request("GET", "/")
+        self.assertIn('.chat:has(input[name="chat"]:checked){order:-1}', page)
+        self.assertIn("<input type=checkbox name=chat value='1' checked hidden><span class=chat-title>", page)
+        self.assertIn("<input type=checkbox name=chat value='2' hidden><span class=chat-title>", page)
+        self.assertNotIn("<label><input type=checkbox name=chat", page)
+        self.assertIn("class=group-membership", page)
+        self.assertLess(page.index("data-id='1'"), page.index("data-id='2'"))
+
     def test_public_chat_link_and_recent_results_are_visible(self):
         self.service.state["dialogs"] = [
             {"id": "123", "title": "Public", "type": "channel", "username": "public_name"},

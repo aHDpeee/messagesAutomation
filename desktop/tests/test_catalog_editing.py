@@ -19,15 +19,18 @@ class CatalogEditingTests(unittest.TestCase):
         catalog.write_catalog(service.state, service.catalog_path)
         return service
 
-    def edit_title(self, text, title):
+    def edit_row(self, text, **fields):
         reader = csv.DictReader(io.StringIO(text))
         rows = list(reader)
-        rows[0]["title"] = title
+        rows[0].update(fields)
         output = io.StringIO(newline="")
         writer = csv.DictWriter(output, fieldnames=reader.fieldnames)
         writer.writeheader()
         writer.writerows(rows)
         return output.getvalue()
+
+    def edit_title(self, text, title):
+        return self.edit_row(text, title=title)
 
     def test_import_backup_and_restore(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -96,14 +99,76 @@ class CatalogEditingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             service = self.setup_service(Path(folder))
             text, _ = service.catalog_content()
-            reader = csv.DictReader(io.StringIO(text))
-            rows = list(reader)
-            rows[0]["last_message_date"] = "yesterday-ish"
-            output = io.StringIO(newline="")
-            writer = csv.DictWriter(output, fieldnames=reader.fieldnames)
-            writer.writeheader(); writer.writerows(rows)
             with self.assertRaisesRegex(ValueError, "Invalid date"):
-                service.import_catalog(output.getvalue())
+                service.import_catalog(self.edit_row(text, last_message_date="yesterday-ish"))
+
+    def test_spreadsheet_date_is_normalized_to_iso(self):
+        with tempfile.TemporaryDirectory() as folder:
+            service = self.setup_service(Path(folder))
+            text, _ = service.catalog_content()
+            service.import_catalog(self.edit_row(text, last_message_date="11/15/26 4:15"))
+            self.assertEqual(service.state["dialogs"][0]["last_message_date"], "2026-11-15T04:15:00+00:00")
+            current, _ = service.catalog_content()
+            self.assertIn("2026-11-15T04:15:00+00:00", current)
+
+    def test_spreadsheet_date_with_ampm_and_seconds_is_normalized(self):
+        with tempfile.TemporaryDirectory() as folder:
+            service = self.setup_service(Path(folder))
+            text, _ = service.catalog_content()
+            service.import_catalog(self.edit_row(text, last_message_date="11/15/2026 4:15:30 PM"))
+            self.assertEqual(service.state["dialogs"][0]["last_message_date"], "2026-11-15T16:15:30+00:00")
+
+    def test_all_date_fields_accept_spreadsheet_formats(self):
+        from datetime import datetime, timezone
+        with tempfile.TemporaryDirectory() as folder:
+            service = self.setup_service(Path(folder))
+            text, _ = service.catalog_content()
+            service.import_catalog(self.edit_row(text, added_at="11/15/26", members_exported_at="11/15/2026 4:15"))
+            dialog = service.state["dialogs"][0]
+            self.assertEqual(dialog["added_at"], "2026-11-15T00:00:00+00:00")
+            self.assertEqual(dialog["members_exported_at"], "2026-11-15T04:15:00+00:00")
+            serial = (datetime(2026, 11, 15, tzinfo=timezone.utc) - datetime(1899, 12, 30, tzinfo=timezone.utc)).days
+            service.import_catalog(self.edit_row(text, last_message_date=str(serial)))
+            self.assertEqual(service.state["dialogs"][0]["last_message_date"], "2026-11-15T00:00:00+00:00")
+
+    def test_external_spreadsheet_dates_and_groups_are_adopted_by_sync(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = self.setup_service(root)
+            text, _ = service.catalog_content()
+            service.catalog_path.write_text(
+                self.edit_row(text, last_message_date="11/15/26 4:15", blocks="Family"),
+                encoding="utf-8",
+            )
+            self.assertTrue(service.sync_catalog())
+            self.assertEqual(service.state["dialogs"][0]["last_message_date"], "2026-11-15T04:15:00+00:00")
+            self.assertTrue(any(b["name"] == "Family" and "-1001" in b["chat_ids"] for b in service.state["blocks"].values()))
+            reopened = DirectService(None, root / "state", root / "exports")
+            self.assertEqual(reopened.state["dialogs"][0]["last_message_date"], "2026-11-15T04:15:00+00:00")
+
+    def test_impossible_calendar_date_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            service = self.setup_service(Path(folder))
+            text, _ = service.catalog_content()
+            with self.assertRaisesRegex(ValueError, "Invalid date in last_message_date"):
+                service.import_catalog(self.edit_row(text, last_message_date="13/15/26 4:15"))
+
+    def test_csv_removes_groups_that_are_not_in_the_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            service = self.setup_service(Path(folder))
+            service.mutate_catalog(lambda state: catalog.create_block(state, "Old"))
+            self.assertEqual(len(service.state["blocks"]), 2)
+            text, _ = service.catalog_content()
+            service.import_catalog(self.edit_row(text, blocks="Work"))
+            self.assertEqual([b["name"] for b in service.state["blocks"].values()], ["Work"])
+            self.assertEqual(next(iter(service.state["blocks"].values()))["chat_ids"], ["-1001"])
+
+    def test_group_id_is_stable_when_csv_keeps_its_name(self):
+        with tempfile.TemporaryDirectory() as folder:
+            service = self.setup_service(Path(folder))
+            text, _ = service.catalog_content()
+            service.import_catalog(self.edit_row(text, blocks="Friends"))
+            self.assertEqual(service.state["blocks"]["a"]["chat_ids"], ["-1001"])
 
     def test_selection_adopts_external_csv_before_saving(self):
         with tempfile.TemporaryDirectory() as folder:
