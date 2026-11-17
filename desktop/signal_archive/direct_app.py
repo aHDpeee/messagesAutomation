@@ -37,6 +37,7 @@ document.querySelectorAll('input[type="datetime-local"]').forEach(input => {
         const d = new Date(instant), pad = n => String(n).padStart(2, '0');
         if (!isNaN(d)) input.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
     }
+    if (input.id === 'single-start') input.dataset.initial = input.value;
     input.form.addEventListener('submit', event => {
         if (!input.value) return;
         const d = new Date(input.value), pad = n => String(n).padStart(2, '0');
@@ -62,7 +63,7 @@ function markSelectionDirty() {
     selectionDirty = true;
     document.getElementById('selectionNotice').textContent = 'Selection changed. Save it before exporting.';
 }
-document.querySelectorAll('.chat input, form[action="/select"] input[name="block"]').forEach(input => input.addEventListener('change', markSelectionDirty));
+document.querySelectorAll('.chat input[name="chat"], form[action="/select"] input[name="block"]').forEach(input => input.addEventListener('change', markSelectionDirty));
 function ensureSelectionSaved() {
     if (!selectionDirty) return true;
     document.getElementById('selectionNotice').textContent = 'Save your selection before exporting.';
@@ -78,8 +79,85 @@ function rememberRefresh(kind = 'refresh dialogs') {
     return true;
 }
 function filter() {
-    let q = document.getElementById('search').value.toLowerCase(), k = document.getElementById('kind').value;
-    document.querySelectorAll('.chat').forEach(x => x.hidden = !x.dataset.search.includes(q) || (k && x.dataset.type !== k));
+    let q = document.getElementById('search').value.toLowerCase();
+    document.querySelectorAll('.chat').forEach(x => {
+        x.hidden = !x.dataset.search.includes(q);
+    });
+}
+let activeGroup = 'ungrouped';
+let groupSavePending = false;
+function syncGroupCheckboxes() {
+    document.querySelectorAll('.chat').forEach(row => {
+        const box = row.querySelector('.group-membership');
+        if (!box) return;
+        const groups = (row.dataset.groups || '').split(' ').filter(Boolean);
+        box.checked = activeGroup === 'ungrouped' ? groups.length === 0 : groups.includes(activeGroup);
+    });
+}
+function showGroup(id, button) {
+    activeGroup = id;
+    document.querySelectorAll('.group-tab').forEach(tab => tab.setAttribute('aria-selected', tab === button ? 'true' : 'false'));
+    syncGroupCheckboxes();
+    filter();
+}
+async function saveGroupMembership(box) {
+    if (groupSavePending) { syncGroupCheckboxes(); return; }
+    const row = box.closest('.chat'), group = activeGroup, value = box.checked;
+    if (group === 'ungrouped' && !value) {
+        box.checked = true;
+        document.getElementById('group-notice').textContent = 'Choose a named group to move this chat out of Ungrouped.';
+        return;
+    }
+    groupSavePending = true;
+    const checkboxes = document.querySelectorAll('.group-membership');
+    checkboxes.forEach(x => x.disabled = true);
+    try {
+        const fields = new URLSearchParams({token: refreshToken, chat_id: row.dataset.id, group, checked: value ? 'yes' : 'no', expected_hash: document.getElementById('group-catalog-hash').value});
+        const response = await fetch('/group-membership', {method: 'POST', body: fields});
+        const result = await response.json();
+        if (!response.ok) throw Error(result.error || 'Could not save group.');
+        row.dataset.groups = result.groups.join(' ');
+        document.getElementById('group-catalog-hash').value = result.hash;
+        document.getElementById('group-notice').textContent = 'Group saved.';
+    } catch (error) { document.getElementById('group-notice').textContent = error.message || 'Could not save group.'; }
+    finally { groupSavePending = false; checkboxes.forEach(x => x.disabled = false); syncGroupCheckboxes(); }
+}
+function showPage(id) {
+    document.querySelectorAll('[data-page]').forEach(page => page.hidden = page.dataset.page !== id || page.dataset.offlineDisabled === 'yes');
+    document.querySelectorAll('.page-tab').forEach(tab => tab.setAttribute('aria-selected', tab.dataset.target === id ? 'true' : 'false'));
+}
+function openSingleExport(id, title, start, end) {
+    const dialog = document.getElementById('single-dialog');
+    document.getElementById('single-chat-id').value = id;
+    document.getElementById('single-chat-title').textContent = title;
+    const startInput = document.getElementById('single-start'), endInput = document.getElementById('single-end');
+    startInput.value = start || startInput.dataset.initial;
+    endInput.value = end || '';
+    dialog.showModal();
+}
+async function previewCatalog(form, operation) {
+    const status = document.getElementById('catalog-status');
+    try {
+        if (operation === 'upload') {
+            const file = form.querySelector('input[type=file]').files[0];
+            if (!file) throw Error('Choose a CSV file.');
+            if (file.size > 2000000) throw Error('CSV file is too large (maximum 2 MB).');
+            form.querySelector('input[name=csv]').value = await file.text();
+        }
+        const data = new URLSearchParams(new FormData(form));
+        data.set('operation', operation);
+        if (['edit', 'upload'].includes(operation) && new TextEncoder().encode(data.get('csv') || '').length > 2000000) throw Error('CSV is too large (maximum 2 MB).');
+        if (data.toString().length > 8000000) throw Error('CSV is too large to upload.');
+        const response = await fetch('/catalog-preview', {method: 'POST', body: data});
+        const result = await response.json();
+        if (!response.ok) throw Error(result.error || 'CSV validation failed.');
+        const expected = form.querySelector('input[name=expected_hash]');
+        if (operation === 'edit' && expected.value && expected.value !== result.hash) throw Error('Catalog changed outside the browser. Reload the page before saving.');
+        expected.value = result.hash;
+        const warning = `Replace the current chat list?\n${result.chats} chats, ${result.selected} selected, ${result.blocks} groups.\nA backup will be saved.`;
+        if (confirm(warning)) form.submit();
+    } catch (error) { status.textContent = error.message || 'Unable to check the CSV.'; }
+    return false;
 }
 function selectVisible(value) {
     document.querySelectorAll('.chat').forEach(x => {
@@ -330,6 +408,11 @@ async def scheduler(runtime: Runtime):
     """Run once per local calendar day while the app is running, with catch-up."""
     while True:
         service = runtime.service
+        if not service.lock.locked() and hasattr(service, "sync_catalog"):
+            try:
+                service.sync_catalog()
+            except (OSError, ValueError, RuntimeError) as exc:
+                service.catalog_sync_error = str(exc)
         settings = service.state.get("schedule", {})
         now = datetime.now().astimezone()
         target = settings.get("time", "03:15")
@@ -339,7 +422,7 @@ async def scheduler(runtime: Runtime):
             if now < due:
                 due -= timedelta(days=1)
             day = due.date().isoformat()
-            if settings.get("enabled") and settings.get("last_day") != day and settings.get("failed_day") != day and service.state["selected"]:
+            if settings.get("enabled") and settings.get("last_day") != day and settings.get("failed_day") != day and service.state["selected"] and service.catalog_is_current():
                 if (not runtime.future or runtime.future.done()) and not service.lock.locked():
                     try:
                         runtime.scheduled_cancel_requested = False
@@ -414,9 +497,18 @@ def make_handler(runtime: Runtime, token: str):
                 self.send(json.dumps(state, ensure_ascii=False), content_type="application/json; charset=utf-8"); return
             if self.path != "/":
                 self.send("Not found", 404); return
+            def sync_visible_catalog():
+                service = runtime.service
+                if hasattr(service, "sync_catalog"):
+                    try:
+                        service.sync_catalog()
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        service.catalog_sync_error = str(exc)
+            runtime.call(sync_visible_catalog)
             state = runtime.call(lambda: json.loads(json.dumps(runtime.service.state)))
             offline = getattr(runtime, "offline_legacy", False)
             hidden_live = "hidden" if offline else ""
+            offline_disabled = "data-offline-disabled=yes" if offline else ""
             offline_notice = (f"<section><h2>Офлайн: старый архив</h2><p>Telegram не подключается. Файлы сохраняются в {html.escape(str(runtime.service.exports))}.</p><form method=post action=/open-exports><input type=hidden name=token value='{token}'><button>Открыть папку экспорта</button></form></section>" if offline else "")
             chosen = set(state["selected"])
             selection_hash = selection_fingerprint(state["selected"])
@@ -429,28 +521,34 @@ def make_handler(runtime: Runtime, token: str):
                 default_start = datetime.now().astimezone() - timedelta(days=1)
             start_value = default_start.strftime("%Y-%m-%dT%H:%M")
             rows = []
-            for d in state["dialogs"]:
+            for d in sorted(state["dialogs"], key=lambda d: (str(d["id"]) not in chosen, str(d.get("title", "")).casefold())):
                 title = html.escape(d["title"], quote=True)
                 kind = html.escape(d["type"], quote=True)
                 ident = html.escape(d["id"], quote=True)
                 accessible = d.get("accessible", True)
                 member = f"<button class=secondary type=submit form=members name=chat_id value='{ident}'>Export members</button>" if d["type"] == "group" and accessible else ""
-                single = f"<button class=secondary type=submit form=single-export name=chat_id value='{ident}'>Export chat</button>" if accessible else ""
+                settings = state.get("single_export_settings", {}).get(str(d["id"]), {})
+                single_start = html.escape(str(settings.get("start", "")), quote=True)
+                single_end = html.escape(str(settings.get("end", "")), quote=True)
+                single = f"<button class=secondary type=button data-id='{ident}' data-title='{title}' data-start='{single_start}' data-end='{single_end}' onclick='openSingleExport(this.dataset.id, this.dataset.title, this.dataset.start, this.dataset.end)'>Export chat</button>" if accessible else ""
                 username = d.get("username") or ""
                 if re.fullmatch(r"[A-Za-z0-9_]{1,32}", username):
                     chat_title = f"<a href='tg://resolve?domain={username}' title='Open chat in Telegram'>{title} ↗</a>"
                 else:
                     chat_title = f"{title} <small title='Telegram provides no public chat link'>No public link</small>"
                 availability = " · inaccessible" if not accessible else ""
-                rows.append(f"<div class=chat data-type='{kind}' data-search='{title.lower()} {kind}'><label><input type=checkbox name=chat value='{ident}' {'checked' if ident in chosen else ''}> <span>{chat_title} <small>{kind}{availability}</small></span></label>{single}{member}</div>")
+                groups = ' '.join(str(key) for key, block in state.get('blocks', {}).items() if str(d['id']) in block.get('chat_ids', []))
+                groups = html.escape(groups, quote=True)
+                rows.append(f"<div class=chat data-id='{ident}' data-groups='{groups}' data-type='{kind}' data-search='{title.lower()} {kind}'><label><input type=checkbox name=chat value='{ident}' {'checked' if ident in chosen else ''}> <span>{chat_title} <small>{kind}{availability}</small></span></label><label><input type=checkbox class=group-membership {'checked' if not groups else ''} onchange='saveGroupMembership(this)'> In this group</label>{single}{member}</div>")
             visible_ids = {d["id"] for d in state["dialogs"]}
             for missing in sorted(chosen - visible_ids):
                 ident = html.escape(missing, quote=True)
-                rows.append(f"<div class=chat data-type='unavailable' data-search='{ident} unavailable'><label><input type=checkbox name=chat value='{ident}' checked> {ident} <small>Unavailable in latest refresh — uncheck to remove</small></label></div>")
+                rows.append(f"<div class=chat data-id='{ident}' data-type='unavailable' data-search='{ident} unavailable'><label><input type=checkbox name=chat value='{ident}' checked> {ident} <small>Unavailable in latest refresh — uncheck to remove</small></label><label><input type=checkbox class=group-membership checked onchange='saveGroupMembership(this)'> In this group</label></div>")
             schedule = state.get("schedule", {})
             retention = state.get("retention", {})
             retention_checked = "checked" if retention.get("enabled") else ""
             encryption_checked = "checked" if state.get("encryption_enabled") else ""
+            member_enrichment_checked = "checked" if state.get("member_enrichment_enabled") else ""
             retention_days = int(retention.get("days", 30))
             checked = "checked" if schedule.get("enabled") else ""
             startup_checked = "checked" if autostart.enabled() else ""
@@ -486,6 +584,26 @@ def make_handler(runtime: Runtime, token: str):
                 block_rows.append(f"<details><summary>{name}</summary><form method=post action=/block-assign><input type=hidden name=token value='{token}'><input type=hidden name=block value='{bid}'><div class=chat-list tabindex=0 aria-label='Chats in {name}'>{checks}</div><button>Save block chats</button></form><form method=post action=/block-rename><input type=hidden name=token value='{token}'><input type=hidden name=block value='{bid}'><input name=name value='{name}' required><button>Rename</button></form><form method=post action=/block-delete onsubmit=\"return confirm('Delete this block?')\"><input type=hidden name=token value='{token}'><input type=hidden name=block value='{bid}'><button>Delete block</button></form></details>")
             blocks_html = ''.join(block_rows)
             block_select_html = ''.join(block_options)
+            group_tabs = ''.join(f"<button type=button class=group-tab role=tab aria-selected=false data-group='{html.escape(str(key), quote=True)}' onclick='showGroup(this.dataset.group,this)'>{html.escape(str(block['name']))}</button>" for key, block in state.get('blocks', {}).items())
+            try:
+                csv_text, csv_hash = runtime.call(runtime.service.catalog_content)
+                backups = runtime.call(runtime.service.catalog_backups)
+                catalog_editor = html.escape(csv_text)
+                catalog_hash = html.escape(csv_hash, quote=True)
+                backup_options = ''.join(f"<option value='{html.escape(name, quote=True)}'>{html.escape(name)}</option>" for name in backups)
+                catalog_notice = ""
+            except (OSError, UnicodeError, ValueError) as exc:
+                catalog_editor, catalog_hash, backup_options = "", "", ""
+                catalog_notice = "Cannot open catalog: " + html.escape(str(exc))
+            if not runtime.call(runtime.service.catalog_is_current):
+                error = runtime.call(lambda: getattr(runtime.service, "catalog_sync_error", ""))
+                catalog_conflict = ("<section role=alert><strong>Cannot apply changes from chats.csv.</strong> "
+                    "The file was kept unchanged; previous chat settings remain active. "
+                    + (html.escape(error) + " " if error else "") +
+                    "Correct the file or open <button type=button onclick=\"showPage('settings')\">Settings</button> "
+                    "to review or restore a backup.</section>")
+            else:
+                catalog_conflict = ""
             old_archive_html = ""
             if offline and legacy_archive.DEFAULT_DB.is_file():
                 try:
@@ -510,21 +628,26 @@ def make_handler(runtime: Runtime, token: str):
             elif offline:
                 old_archive_html = f"<section><h2>Старый архив не найден</h2><p>{html.escape(str(legacy_archive.DEFAULT_DB))}</p></section>"
             password_field = "<label>ZIP password (optional) <input type=password name=archive_password autocomplete=new-password></label>"
-            lan_section = "" if self.headers.get("X-Signal-Remote") == "1" else f"<details><summary>LAN access and paired devices</summary>{lan_html}</details>"
+            lan_section = "" if self.headers.get("X-Signal-Remote") == "1" else f"<details data-page=settings hidden><summary>LAN access and paired devices</summary>{lan_html}</details>"
             self.send(f'''<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Signal Archive</title><style>
-            :root{{color-scheme:dark;--panel:#172331;--line:#304357;--muted:#a7bbcb;--accent:#65d6c0}}*{{box-sizing:border-box}}body{{font:16px/1.5 system-ui,sans-serif;background:#0c1520;color:#edf5f8;max-width:1000px;margin:auto;padding:28px}}h1{{font-size:2rem;margin-bottom:0}}h2{{font-size:1.2rem;margin-top:0}}h3{{font-size:1rem}}section{{background:var(--panel);padding:22px;border:1px solid var(--line);border-radius:16px;margin:16px 0;box-shadow:0 8px 24px #0003}}button,input,select{{font:inherit}}button{{background:var(--accent);color:#07231e;border:0;border-radius:9px;padding:10px 16px;font-weight:650;cursor:pointer}}button:hover{{filter:brightness(1.12)}}button.secondary{{background:#263c4d;color:#e6f4f5}}input:not([type=checkbox]),select{{background:#101d2a;color:inherit;border:1px solid #52697b;border-radius:8px;padding:9px}}input[type=checkbox]{{accent-color:var(--accent);width:18px;height:18px;vertical-align:middle}}.chat-list{{max-height: min(55vh, 32rem);overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:10px}}.recent-list{{max-height:12rem;overflow-y:auto;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:10px}}.recent-list ul{{padding-right:16px}}.chat{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-bottom:1px solid var(--line)}}.chat label{{display:flex;align-items:center;gap:10px;flex:1;min-width:0}}.chat:last-child{{border-bottom:0}}[hidden]{{display:none!important}}small{{color:var(--muted)}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}.activity{{border-color:var(--accent)}}#status{{background:#0e1b27;padding:14px;border-radius:9px;margin:0 0 12px}}a{{color:#83e4d2;text-decoration:none}}a:hover{{text-decoration:underline}}summary{{cursor:pointer;color:#a1ddd3;margin-top:16px}}@media(max-width:600px){{body{{padding:12px}}section{{padding:16px}}.chat{{align-items:flex-start;flex-wrap:wrap}}}}
-            </style></head><body><h1>Signal Archive</h1><p>Text-only Telegram exports on this computer. <a href='/codex-guide' title='Codex archive analysis guide'>(i) Codex guide</a></p>{offline_notice}
-            {shortcut_offer}<section class=activity><h2>Latest activity</h2><pre id=status role=status aria-live=polite>Checking activity…</pre><form method=post action=/cancel><input type=hidden name=token value='{token}'><button class=secondary>Stop current operation</button></form><small>Progress updates automatically. Completed files stay in the export folder.</small><form method=post action=/shutdown onsubmit="return confirm('Close Signal Archive? Any running export will stop.')"><input type=hidden name=token value='{token}'><p><button class=secondary>Close Signal Archive</button></p></form></section>{lan_section}
-            <details><summary>Shortcuts and access</summary><p>Create a shortcut to start Signal Archive or open its existing browser interface.</p><form method=post action=/shortcut><input type=hidden name=token value='{token}'><button name=location value=desktop>Create desktop shortcut</button> <button name=location value=application>Create shortcut in application folder</button></form><small>The preview uses a browser for compatibility. The interface is currently accessible only on this computer. <a href='https://qna.habr.com/q/800445' target=_blank rel='noopener noreferrer'>About local network access</a></small></details>
-            <section {hidden_live}><h2>Export</h2><p>{len(chosen)} chats selected. No media files are downloaded.</p><form method=post action=/export onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> {password_field} <button>Export through now</button></form><details><summary>More export options</summary><p>Choose a specific time interval.</p><form method=post action=/interval onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> <label>To <input type=datetime-local name=end required></label> {password_field} <button>Export interval</button></form></details><p>Files: {html.escape(str(runtime.service.exports))}</p><form method=post action=/open-exports><input type=hidden name=token value='{token}'><button>Open export folder</button></form><h3>Most recent successful exports</h3><div class=recent-list tabindex=0 aria-label="Most recent successful exports"><ul>{last_export_html or '<li>No successful export yet.</li>'}</ul></div></section>
+            :root{{color-scheme:dark;--panel:#172331;--line:#304357;--muted:#a7bbcb;--accent:#65d6c0}}*{{box-sizing:border-box}}body{{font:16px/1.5 system-ui,sans-serif;background:#0c1520;color:#edf5f8;max-width:1000px;margin:auto;padding:28px}}h1{{font-size:2rem;margin-bottom:0}}h2{{font-size:1.2rem;margin-top:0}}h3{{font-size:1rem}}section{{background:var(--panel);padding:22px;border:1px solid var(--line);border-radius:16px;margin:16px 0;box-shadow:0 8px 24px #0003}}button,input,select{{font:inherit}}button{{background:var(--accent);color:#07231e;border:0;border-radius:9px;padding:10px 16px;font-weight:650;cursor:pointer}}button:hover{{filter:brightness(1.12)}}button.secondary{{background:#263c4d;color:#e6f4f5}}input:not([type=checkbox]),select{{background:#101d2a;color:inherit;border:1px solid #52697b;border-radius:8px;padding:9px}}input[type=checkbox]{{accent-color:var(--accent);width:18px;height:18px;vertical-align:middle}}.chat-list{{max-height: min(55vh, 32rem);overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column}}.recent-list{{max-height:12rem;overflow-y:auto;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:10px}}.recent-list ul{{padding-right:16px}}.chat{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-bottom:1px solid var(--line)}}.chat label{{display:flex;align-items:center;gap:10px;flex:1;min-width:0}}.chat:last-child{{border-bottom:0}}.chat:has(input:checked){{order:-1}}dialog{{background:var(--panel);color:inherit;border:1px solid var(--line);border-radius:16px;max-width:min(95vw,600px)}}dialog::backdrop{{background:#000a}}.tabs{{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}}[aria-selected=true]{{outline:2px solid white}}[hidden]{{display:none!important}}small{{color:var(--muted)}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}.activity{{border-color:var(--accent)}}#status{{background:#0e1b27;padding:14px;border-radius:9px;margin:0 0 12px}}a{{color:#83e4d2;text-decoration:none}}a:hover{{text-decoration:underline}}summary{{cursor:pointer;color:#a1ddd3;margin-top:16px}}@media(max-width:600px){{body{{padding:12px}}section{{padding:16px}}.chat{{align-items:flex-start;flex-wrap:wrap}}}}
+            </style></head><body><h1>Signal Archive</h1><p>Text-only Telegram exports on this computer. <a href='/codex-guide' title='Codex archive analysis guide'>(i) Codex guide</a></p>{offline_notice}<nav class=tabs role=tablist aria-label='Pages'><button class=page-tab data-target=main aria-selected=true onclick="showPage('main')">Chats and export</button><button class=page-tab data-target=settings aria-selected=false onclick="showPage('settings')">Settings</button></nav>
+            {shortcut_offer}{catalog_conflict}<section class=activity><h2>Latest activity</h2><pre id=status role=status aria-live=polite>Checking activity…</pre><form method=post action=/cancel><input type=hidden name=token value='{token}'><button class=secondary>Stop current operation</button></form><small>Progress updates automatically. Completed files stay in the export folder.</small><form method=post action=/shutdown onsubmit="return confirm('Close Signal Archive? Any running export will stop.')"><input type=hidden name=token value='{token}'><p><button class=secondary>Close Signal Archive</button></p></form></section>{lan_section}
+            <details data-page=settings hidden><summary>Shortcuts and access</summary><p>Create a shortcut to start Signal Archive or open its existing browser interface.</p><form method=post action=/shortcut><input type=hidden name=token value='{token}'><button name=location value=desktop>Create desktop shortcut</button> <button name=location value=application>Create shortcut in application folder</button></form><small>The preview uses a browser for compatibility. The interface is currently accessible only on this computer. <a href='https://qna.habr.com/q/800445' target=_blank rel='noopener noreferrer'>About local network access</a></small></details>
+            <section data-page=main {hidden_live} {offline_disabled}><h2>Export</h2><p>{len(chosen)} chats selected. No media files are downloaded.</p><form method=post action=/export onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> <button>Export through now</button></form><details><summary>More export options</summary><p>Choose a specific time interval.</p><form method=post action=/interval onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> <label>To <input type=datetime-local name=end required></label> <button>Export interval</button></form></details><p>Files: {html.escape(str(runtime.service.exports))}</p><form method=post action=/open-exports><input type=hidden name=token value='{token}'><button>Open export folder</button></form><h3>Most recent successful exports</h3><div class=recent-list tabindex=0 aria-label="Most recent successful exports"><ul>{last_export_html or '<li>No successful export yet.</li>'}</ul></div></section>
             {old_archive_html}
-            <section {hidden_live}><h2>Schedule</h2><form method=post action=/schedule><input type=hidden name=token value='{token}'><label><input type=checkbox name=enabled value=yes {checked}> Daily while the app is running</label> <input type=time name=time value='{selected_time}' required> <button>Save schedule</button></form><small>If the app was closed at the scheduled time, it runs when reopened.</small><form method=post action=/encryption><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {encryption_checked}> Password-protect all new ZIP archives</label> <input type=password name=password autocomplete=new-password placeholder="Archive password"> <button>Save encryption</button></p><small>Stored in the OS keyring for scheduled exports. AES ZIP needs a compatible archive reader.</small></form><form method=post action=/retention><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {retention_checked}> Delete app-created archives older than</label> <input type=number name=days min=1 max=36500 value='{retention_days}' required> days <button>Save retention</button></p></form><form method=post action=/autostart><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {startup_checked}> Start Signal Archive when I sign in</label> <button>Save startup setting</button></p></form><small>{html.escape(startup_note)}</small></section>
+            <section data-page=settings hidden><h2>Schedule</h2><form method=post action=/schedule><input type=hidden name=token value='{token}'><label><input type=checkbox name=enabled value=yes {checked}> Daily while the app is running</label> <input type=time name=time value='{selected_time}' required> <button>Save schedule</button></form><small>If the app was closed at the scheduled time, it runs when reopened.</small><form method=post action=/encryption><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {encryption_checked}> Password-protect all new ZIP archives</label> <input type=password name=password autocomplete=new-password placeholder="Archive password"> <button>Save encryption</button></p><small>Stored in the OS keyring for scheduled exports. AES ZIP needs a compatible archive reader.</small></form><form method=post action=/retention><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {retention_checked}> Delete app-created archives older than</label> <input type=number name=days min=1 max=36500 value='{retention_days}' required> days <button>Save retention</button></p></form><form method=post action=/autostart><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {startup_checked}> Start Signal Archive when I sign in</label> <button>Save startup setting</button></p></form><small>{html.escape(startup_note)}</small></section>
 
-            <section {hidden_live}><h2>Choose chats</h2><form id=refreshForm data-started='{last_started}' method=post action=/refresh onsubmit='return rememberRefresh()'><input type=hidden name=token value='{token}'><button>Refresh Telegram chats</button></form><form method=post action=/add-chat onsubmit="return rememberRefresh('add chat')"><input type=hidden name=token value='{token}'><input name=reference placeholder='Chat link, @username, ID or name' required><button>Add chat</button></form><p id=selectionNotice role=status></p><p><input id=search placeholder='Search chats' oninput='filter()'> <select id=kind onchange='filter()' aria-label='Chat type'><option value=''>All types</option><option value=channel>Channels</option><option value=group>Groups</option><option value=chat>Personal chats</option><option value=bot>Bots</option><option value=unavailable>Unavailable</option></select></p><p><button type=button onclick='selectVisible(true)'>Select visible</button> <button type=button onclick='selectVisible(false)'>Clear visible</button></p>
-            <form id=members method=post action=/members><input type=hidden name=token value='{token}'><label><input type=checkbox name=enrich_profiles value=yes> Also fetch visible bios and personal channels (up to 100 profiles; slower)</label> {password_field}</form><small>Phone numbers are included only when Telegram shows them. Member lists and profile details may be incomplete.</small>
-            <form id=single-export method=post action=/single-export><input type=hidden name=token value='{token}'><label>Single chat from <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> {password_field}</form><p>Chat catalog: {html.escape(str(runtime.service.home / 'chats.csv'))}</p><h3>Blocks</h3><form method=post action=/block-create><input type=hidden name=token value='{token}'><input name=name placeholder='New block' maxlength=100 required> <button>Create block</button></form>{blocks_html}
-            <form method=post action=/select><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><p>Select whole blocks: {block_select_html or 'No blocks yet.'}</p><div class=chat-list tabindex=0 aria-label='Chat list'>{''.join(rows) or '<p>Refresh the list to see your Telegram chats.</p>'}</div><p><button>Save selection</button></p></form></section>
-            <script>{UI_SCRIPT}</script></body></html>''')
+            <section data-page=main {hidden_live} {offline_disabled}><h2>Choose chats</h2><form id=refreshForm data-started='{last_started}' method=post action=/refresh onsubmit='return rememberRefresh()'><input type=hidden name=token value='{token}'><button>Refresh Telegram chats</button></form><form method=post action=/add-chat onsubmit="return rememberRefresh('add chat')"><input type=hidden name=token value='{token}'><input name=reference placeholder='Chat link, @username, ID or name' required><button>Add chat</button></form><p id=selectionNotice role=status></p><p><input id=search placeholder='Search chats' oninput='filter()'></p><p><button type=button onclick='selectVisible(true)'>Select visible</button> <button type=button onclick='selectVisible(false)'>Clear visible</button></p>
+            <small>Member lists contain only data visible to your account.</small>
+            <dialog id=single-dialog aria-labelledby=single-chat-title><h2 id=single-chat-title>Export chat</h2><form id=single-export method=post action=/single-export><input type=hidden name=token value='{token}'><input id=single-chat-id type=hidden name=chat_id><p><label>From <input id=single-start type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label></p><p><label>To (leave blank for now) <input id=single-end type=datetime-local name=end></label></p>{password_field}<p><button>Export chat</button> <button type=button class=secondary onclick="document.getElementById('single-dialog').close()">Cancel</button></p><small>Dates are remembered for this chat. Passwords are not saved here.</small></form></dialog><p>Chat catalog: {html.escape(str(runtime.service.home / 'chats.csv'))}</p>
+            <p>Manage and add chat groups under Settings → Manage groups. Check <b>In this group</b> to change membership; the first checkbox chooses chats for export.</p><nav class=tabs role=tablist aria-label='Chat groups'><button type=button class=group-tab role=tab aria-selected=true onclick="showGroup('ungrouped',this)">Ungrouped</button>{group_tabs}</nav><p id=group-notice role=status></p><input id=group-catalog-hash type=hidden value='{catalog_hash}'><form method=post action=/select><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><p>Select whole blocks: {block_select_html or 'No blocks yet.'}</p><div class=chat-list tabindex=0 aria-label='Chat list'>{''.join(rows) or '<p>Refresh the list to see your Telegram chats.</p>'}</div><p><button>Save selection</button></p></form></section>
+            <section data-page=settings hidden><h2>Chat catalog</h2><p>CSV file: <code>{html.escape(str(runtime.service.home / 'chats.csv'))}</code></p><p id=catalog-status role=status>{catalog_notice}</p>
+            <p>Groups are stored per chat in the CSV <code>blocks</code> column. Enter one name or several names separated by commas; leave it empty for Ungrouped. For a group name containing a comma, use a JSON list such as <code>[&quot;Work, projects&quot;]</code>. The <code>type</code> column is the Telegram chat type, not the group. Replace or save the CSV and refresh this page to apply valid changes; you can also upload a CSV below. Invalid files are kept unchanged and reported.</p>
+            <form method=post action=/catalog-reload onsubmit="previewCatalog(this,'reload'); return false"><input type=hidden name=token value='{token}'><input type=hidden name=expected_hash value='{catalog_hash}'><button>Reload from local CSV</button></form>
+            <form method=post action=/catalog-upload onsubmit="previewCatalog(this,'upload'); return false"><input type=hidden name=token value='{token}'><input type=hidden name=expected_hash value='{catalog_hash}'><input type=hidden name=csv><label>Upload CSV <input type=file accept='.csv,text/csv' required></label> <button>Validate and upload</button></form>
+            <form method=post action=/catalog-restore onsubmit="previewCatalog(this,'restore'); return false"><input type=hidden name=token value='{token}'><input type=hidden name=expected_hash value='{catalog_hash}'><label>Restore backup <select name=name required>{backup_options or '<option value="">No backups yet</option>'}</select></label> <button>Review and restore</button></form></section>
+            <section data-page=settings hidden><h2>Member export options</h2><form id=members method=post action=/members><input type=hidden name=token value='{token}'><label><input type=checkbox name=enrich_profiles value=yes {member_enrichment_checked}> Also fetch visible bios and personal channels (up to 100 profiles; slower)</label></form><small>These options apply when you use Export members next to a group. Phone numbers are included only when Telegram shows them.</small></section><section data-page=settings hidden><h2>Manage groups</h2><form method=post action=/block-create><input type=hidden name=token value='{token}'><input name=name placeholder='New block' maxlength=100 required> <button>Create block</button></form>{blocks_html}</section><script>{UI_SCRIPT}</script></body></html>''')
 
         def do_POST(self):
             origin = f"http://127.0.0.1:{self.server.server_port}"
@@ -541,14 +664,85 @@ def make_handler(runtime: Runtime, token: str):
                 return
             try:
                 size = int(self.headers.get("Content-Length", "0"))
-                if not 0 < size <= 1024 * 1024:
+                if not 0 < size <= 8 * 1024 * 1024:
                     raise ValueError("Invalid request size")
                 form = parse_qs(self.rfile.read(size).decode("utf-8"))
                 if not secrets.compare_digest(form.get("token", [""])[0], token):
                     self.send("Invalid token", 403); return
                 if getattr(runtime, "offline_legacy", False) and self.path not in {"/legacy-export", "/open-exports", "/cancel", "/shutdown"}:
                     raise ValueError("В офлайн-режиме доступен только старый локальный архив.")
-                if self.path == "/lan-start":
+                if self.path == "/group-membership":
+                    def change_membership():
+                        service = runtime.service
+                        chat_id = str(int(form.get("chat_id", [""])[0]))
+                        group = form.get("group", [""])[0]
+                        checked = form.get("checked", [""])[0]
+                        expected = form.get("expected_hash", [""])[0]
+                        if not re.fullmatch(r"[0-9a-f]{64}", expected) or catalog._file_hash(service.catalog_path) != expected:
+                            raise ValueError("Catalog changed. Reload the page before editing groups.")
+                        if checked not in {"yes", "no"}:
+                            raise ValueError("Invalid group membership.")
+                        def mutate(state):
+                            catalog.expand_selection(state, [chat_id], [])
+                            blocks = state.get("blocks", {})
+                            if group == "ungrouped":
+                                if checked != "yes":
+                                    raise ValueError("Choose a named group to move a chat out of Ungrouped.")
+                                for block in blocks.values():
+                                    block["chat_ids"] = [item for item in block.get("chat_ids", []) if str(item) != chat_id]
+                            else:
+                                if group not in blocks:
+                                    raise ValueError("Group not found. Reload the page.")
+                                ids = [str(item) for item in blocks[group].get("chat_ids", []) if str(item) != chat_id]
+                                if checked == "yes":
+                                    ids.append(chat_id)
+                                catalog.assign_block(state, group, ids)
+                        service.mutate_catalog(mutate)
+                        groups = [key for key, block in service.state.get("blocks", {}).items() if chat_id in block.get("chat_ids", [])]
+                        return {"groups": groups, "hash": catalog._file_hash(service.catalog_path)}
+                    try:
+                        result = runtime.call(change_membership)
+                        self.send(json.dumps(result), content_type="application/json; charset=utf-8")
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        self.send(json.dumps({"error": str(exc)}), 400, content_type="application/json; charset=utf-8")
+                    return
+                elif self.path == "/catalog-preview":
+                    def preview_catalog():
+                        service = runtime.service
+                        operation = form.get("operation", [""])[0]
+                        if operation in {"edit", "upload"}:
+                            content = form.get("csv", [""])[0]
+                        elif operation == "reload":
+                            content = service.catalog_path.read_bytes()
+                        elif operation == "restore":
+                            backups = {p.name: p for p in catalog.list_catalog_backups(service.catalog_path)}
+                            name = form.get("name", [""])[0]
+                            if name not in backups:
+                                raise ValueError("Catalog backup not found.")
+                            content = backups[name].read_bytes()
+                        else:
+                            raise ValueError("Unknown catalog operation.")
+                        parsed = catalog.parse_catalog(content, service.state)
+                        return {"chats": len(parsed.get("dialogs", [])), "selected": len(parsed.get("selected", [])), "blocks": len(parsed.get("blocks", {})), "hash": catalog._file_hash(service.catalog_path)}
+                    try:
+                        result = runtime.call(preview_catalog)
+                        self.send(json.dumps(result), content_type="application/json; charset=utf-8")
+                    except (OSError, ValueError) as exc:
+                        self.send(json.dumps({"error": str(exc)}), 400, content_type="application/json; charset=utf-8")
+                    return
+                elif self.path in {"/catalog-edit", "/catalog-upload", "/catalog-reload", "/catalog-restore"}:
+                    def change_catalog():
+                        service = runtime.service
+                        expected = form.get("expected_hash", [""])[0] or None
+                        if self.path == "/catalog-restore":
+                            if expected is not None and catalog._file_hash(service.catalog_path) != expected:
+                                raise ValueError("Catalog changed since preview. Preview it again.")
+                            service.restore_catalog(form.get("name", [""])[0], expected_hash=expected)
+                        else:
+                            content = service.catalog_path.read_bytes() if self.path == "/catalog-reload" else form.get("csv", [""])[0]
+                            service.import_catalog(content, expected_hash=expected)
+                    runtime.call(change_catalog)
+                elif self.path == "/lan-start":
                     runtime.start_lan(form["origin"][0], form["certificate"][0], form["private_key"][0], self.server.server_port, form["bind_ip"][0])
                 elif self.path == "/lan-stop":
                     runtime.stop_lan()
@@ -628,13 +822,27 @@ def make_handler(runtime: Runtime, token: str):
                 elif self.path == "/members":
                     chat_id = form["chat_id"][0]
                     enrich_profiles = form.get("enrich_profiles", [""])[0] == "yes"
+                    def remember_member_settings():
+                        runtime.service.state["member_enrichment_enabled"] = enrich_profiles
+                        runtime.service.save()
+                    runtime.call(remember_member_settings)
                     password = form.get('archive_password', [''])[0] or None
                     runtime.submit(lambda: runtime.service.export_members(chat_id, enrich_profiles=enrich_profiles, password=password))
                 elif self.path == "/single-export":
                     chat_id = form["chat_id"][0]
                     start = parse_form_datetime(form, "start")
+                    end = parse_form_datetime(form, "end") if form.get("end", [""])[0] else None
+                    if end is not None and start > end:
+                        raise ValueError("The start date must be before the end date.")
+                    def save_single_settings():
+                        catalog.expand_selection(runtime.service.state, [chat_id], [])
+                        runtime.service.state.setdefault("single_export_settings", {})[chat_id] = {
+                            "start": form["start"][0], "end": form.get("end", [""])[0],
+                        }
+                        runtime.service.save()
+                    runtime.call(save_single_settings)
                     password = form.get('archive_password', [''])[0] or None
-                    runtime.submit(lambda: runtime.service.export_selected(chat_ids=[chat_id], start=start, password=password))
+                    runtime.submit(lambda: runtime.service.export_selected(chat_ids=[chat_id], start=start, end=end, password=password))
                 elif self.path == "/legacy-export":
                     source = form.get("source", [""])[0]
                     if not re.fullmatch(r"(?:none|-?\d+):-?\d+", source):
@@ -651,8 +859,7 @@ def make_handler(runtime: Runtime, token: str):
                         raise ValueError("Refresh the page before saving your selection.")
                     runtime.call(lambda: runtime.service.select(catalog.expand_selection(runtime.service.state, form.get("chat", []), form.get("block", [])), expected_selection=expected))
                 elif self.path in {"/block-create", "/block-rename", "/block-delete", "/block-assign"}:
-                    def update_block():
-                        state = runtime.service.state
+                    def update_block(state):
                         if self.path == "/block-create":
                             catalog.create_block(state, form["name"][0])
                         elif self.path == "/block-rename":
@@ -661,9 +868,7 @@ def make_handler(runtime: Runtime, token: str):
                             catalog.delete_block(state, form["block"][0])
                         else:
                             catalog.assign_block(state, form["block"][0], form.get("chat", []))
-                        runtime.service.save()
-                        catalog.write_catalog(state, runtime.service.home / "chats.csv")
-                    runtime.call(update_block)
+                    runtime.call(lambda: runtime.service.mutate_catalog(update_block))
                 elif self.path == "/schedule":
                     value = form.get("time", [""])[0]
                     if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):

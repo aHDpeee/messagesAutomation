@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Signal Archive
+Comment=Open Signal Archive
+Terminal=false
+Exec="/home/ahdpeee/Projects/messagesAutomation/desktop/.venv-direct/bin/python" "-m" "signal_archive.shortcut_launcher" "--home" "/home/ahdpeee/.signal-archive" "--" "sh" "/home/ahdpeee/Projects/messagesAutomation/desktop/start-existing-session-linux.sh"

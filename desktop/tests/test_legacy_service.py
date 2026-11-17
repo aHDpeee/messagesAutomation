@@ -15,11 +15,6 @@ from signal_archive.direct_service import DirectService
 
 @unittest.skipUnless(importlib.util.find_spec('telethon'), 'Telethon is not installed')
 class LegacyServiceTests(unittest.TestCase):
-    def setUp(self):
-        music = patch('signal_archive.completion_music.play_on_completion')
-        music.start()
-        self.addCleanup(music.stop)
-
     def make_database(self, root):
         path = root / 'old.sqlite'
         con = sqlite3.connect(path)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import hashlib
 import json
 import os
@@ -89,6 +90,9 @@ class DirectService:
     def __init__(self, client: Any, home: Path, exports: Path):
         self.client, self.home, self.exports = client, home, exports
         self.state_path = home / "direct-state.json"
+        self.catalog_path = home / "chats.csv"
+        self.catalog_journal = home / "catalog-import.pending.json"
+        self._recover_catalog_import()
         try:
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
             if not isinstance(self.state, dict):
@@ -99,12 +103,138 @@ class DirectService:
         self.state.setdefault("checkpoints", {})
         self.state.setdefault("dialogs", [])
         self.lock = asyncio.Lock()
+        self.catalog_ready = catalog.initialize_catalog(self.state, self.catalog_path)
+        self.catalog_sync_error = ""
+        if not self.catalog_ready:
+            try:
+                self.sync_catalog()
+            except (ValueError, OSError, RuntimeError) as exc:
+                self.catalog_sync_error = str(exc)
         if self.state.get("job", {}).get("status") == "running":
             self.state["job"].update(status="interrupted", error="The application stopped before this job completed.")
             self.save()
 
     def save(self) -> None:
         _write_state(self.state_path, self.state)
+
+    def _recover_catalog_import(self) -> None:
+        """Finish a validated import after a crash without discarding later edits."""
+        try:
+            pending = json.loads(self.catalog_journal.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        current = catalog._file_hash(self.catalog_path)
+        if current == pending["new_hash"]:
+            _write_state(self.state_path, pending["state"])
+            marker = self.catalog_path.with_name(self.catalog_path.name + ".sha256")
+            catalog._atomic_write(marker, lambda stream: stream.write(current))
+        elif current != pending["old_hash"]:
+            raise RuntimeError("A catalog import was interrupted and the CSV changed afterwards. Preserve both files and resolve the conflict before restarting.")
+        self.catalog_journal.unlink()
+
+    def catalog_content(self) -> tuple[str, str]:
+        data = self.catalog_path.read_bytes()
+        return data.decode("utf-8-sig"), hashlib.sha256(data).hexdigest()
+
+    def catalog_backups(self) -> list[str]:
+        return [p.name for p in catalog.list_catalog_backups(self.catalog_path)]
+
+    def catalog_is_current(self) -> bool:
+        marker = self.catalog_path.with_name(self.catalog_path.name + ".sha256")
+        try:
+            return (not self.catalog_journal.exists() and
+                    catalog._file_hash(self.catalog_path) == marker.read_text(encoding="utf-8-sig").strip())
+        except (OSError, UnicodeError, ValueError):
+            return False
+
+    def sync_catalog(self, *, internal: bool = False) -> bool:
+        """Adopt valid external edits as authoritative, preserving exact CSV bytes."""
+        if self.catalog_is_current():
+            self.catalog_sync_error = ""
+            return False
+        if not internal and self.lock.locked():
+            raise RuntimeError("Wait for the current operation to finish before reloading chats.csv.")
+        if self.catalog_journal.exists():
+            raise RuntimeError("A catalog import needs recovery. Restart the app before changing the catalog.")
+        if self.catalog_path.is_symlink():
+            raise ValueError("Catalog must not be a symbolic link.")
+        content = self.catalog_path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        updated = catalog.parse_catalog(content, self.state)
+        if catalog._file_hash(self.catalog_path) != digest:
+            raise ValueError("Catalog changed while reading it. Try again.")
+        catalog.backup_catalog(self.state, self.catalog_path)
+        _write_state(self.catalog_journal, {"state": updated, "old_hash": digest, "new_hash": digest})
+        if catalog._file_hash(self.catalog_path) != digest:
+            raise ValueError("Catalog changed while applying it. Restart the application to recover safely.")
+        _write_state(self.state_path, updated)
+        marker = self.catalog_path.with_name(self.catalog_path.name + ".sha256")
+        def verify():
+            if catalog._file_hash(self.catalog_path) != digest:
+                raise ValueError("Catalog changed while applying it. Restart the application to recover safely.")
+        catalog._atomic_write(marker, lambda stream: stream.write(digest), verify=verify)
+        self.state = updated
+        self.catalog_journal.unlink(missing_ok=True)
+        self.catalog_ready = True
+        self.catalog_sync_error = ""
+        return True
+
+    def _commit_catalog_state(self, updated: dict, old_hash: str | None) -> None:
+        with tempfile.TemporaryDirectory(prefix="catalog-import-") as folder:
+            candidate = Path(folder) / "candidate.csv"
+            catalog.write_catalog(updated, candidate)
+            new_hash = catalog._file_hash(candidate)
+        _write_state(self.catalog_journal, {"state": updated, "old_hash": old_hash, "new_hash": new_hash})
+        try:
+            catalog.write_catalog(updated, self.catalog_path, expected_hash=old_hash, importing=True)
+            _write_state(self.state_path, updated)
+        except BaseException:
+            if catalog._file_hash(self.catalog_path) == old_hash:
+                self.catalog_journal.unlink(missing_ok=True)
+            raise
+        self.state = updated
+        self.catalog_journal.unlink(missing_ok=True)
+        self.catalog_ready = True
+
+    def mutate_catalog(self, mutate, *, internal: bool = False) -> None:
+        """Apply an ordinary catalog edit only while the on-disk CSV is unchanged."""
+        if not internal and self.lock.locked():
+            raise RuntimeError("Wait for the current operation to finish before changing the catalog.")
+        self.sync_catalog(internal=internal)
+        if self.catalog_journal.exists():
+            raise RuntimeError("A catalog import needs recovery. Restart the app before changing the catalog.")
+        marker = self.catalog_path.with_name(self.catalog_path.name + ".sha256")
+        try:
+            expected = marker.read_text(encoding="utf-8-sig").strip()
+        except FileNotFoundError:
+            raise ValueError("Catalog may have external edits. Reload chats.csv before saving.") from None
+        if catalog._file_hash(self.catalog_path) != expected:
+            raise ValueError("Catalog changed outside the app. Reload chats.csv before saving.")
+        updated = copy.deepcopy(self.state)
+        mutate(updated)
+        self._commit_catalog_state(updated, expected)
+
+    def import_catalog(self, content: bytes | str, *, expected_hash: str | None = None) -> str:
+        if self.lock.locked():
+            raise RuntimeError("Wait for the current operation to finish before changing the catalog.")
+        if self.catalog_journal.exists():
+            raise RuntimeError("A catalog import needs recovery. Restart the app before changing the catalog.")
+        if expected_hash is not None and catalog._file_hash(self.catalog_path) != expected_hash:
+            raise ValueError("Catalog changed since it was opened. Reload it before saving.")
+        old_hash = catalog._file_hash(self.catalog_path)
+        updated = catalog.parse_catalog(content, self.state)
+        backup = catalog.backup_catalog(self.state, self.catalog_path)
+        catalog.backup_external_catalog(self.catalog_path, backup, expected_hash=old_hash)
+        self._commit_catalog_state(updated, old_hash)
+        return backup.name
+
+    def restore_catalog(self, name: str, *, expected_hash: str | None = None) -> str:
+        if self.lock.locked():
+            raise RuntimeError("Wait for the current operation to finish before changing the catalog.")
+        matches = {p.name: p for p in catalog.list_catalog_backups(self.catalog_path)}
+        if name not in matches:
+            raise ValueError("Catalog backup not found.")
+        return self.import_catalog(matches[name].read_bytes(), expected_hash=expected_hash)
 
     def configure_encryption(self, enabled: bool, password: str = "") -> None:
         from .direct_app import _keyring, _secret_account, SERVICE
@@ -150,6 +280,7 @@ class DirectService:
             raise RuntimeError("This workspace belongs to a different Telegram account. Use a separate application home for this account.")
 
     def select(self, ids: list[str], *, expected_selection: str | None = None) -> None:
+        self.sync_catalog()
         if expected_selection is not None and selection_fingerprint(self.state["selected"]) != expected_selection:
             raise ValueError("The saved selection changed in another tab. Refresh the page before saving.")
         # Allow retaining a previously selected source which disappeared from a
@@ -158,9 +289,7 @@ class DirectService:
         selected = list(dict.fromkeys(str(int(item)) for item in ids))
         if any(item not in available for item in selected):
             raise ValueError("A selected chat is not in the current dialog list. Refresh it first.")
-        self.state["selected"] = selected
-        self.save()
-        catalog.write_catalog(self.state, self.home / "chats.csv")
+        self.mutate_catalog(lambda state: state.update(selected=selected))
 
     def cooldown_remaining(self) -> float:
         until = self.state.get("cooldown_until")
@@ -232,8 +361,7 @@ class DirectService:
             dialogs = []
             async for dialog in pace_iterator(self.client.iter_dialogs()):
                 dialogs.append(_dialog_record(dialog, set()))
-            self.state["dialogs"] = catalog.merge_dialogs(self.state, dialogs)
-            catalog.write_catalog(self.state, self.home / "chats.csv")
+            self.mutate_catalog(lambda state: state.update(dialogs=catalog.merge_dialogs(state, dialogs)), internal=True)
             return {"count": len(dialogs)}
 
         await self._run("refresh dialogs", refresh)
@@ -243,39 +371,52 @@ class DirectService:
         from .chat_add import resolve_chat
         async def add():
             record, method = await resolve_chat(self.client, reference, self.state["dialogs"])
-            dialogs = [d for d in self.state["dialogs"] if str(d["id"]) != str(record["id"])] + [record]
-            self.state["dialogs"] = catalog.merge_dialogs(self.state, dialogs, method=method)
             ident = str(record["id"])
-            if ident not in self.state["selected"]:
-                self.state["selected"].append(ident)
-            catalog.write_catalog(self.state, self.home / "chats.csv")
+            def update(state):
+                dialogs = [d for d in state["dialogs"] if str(d["id"]) != ident] + [record]
+                state["dialogs"] = catalog.merge_dialogs(state, dialogs, method=method)
+                if ident not in state["selected"]:
+                    state["selected"].append(ident)
+            self.mutate_catalog(update, internal=True)
             return {"id": record["id"], "title": record["title"]}
         return await self._run("add chat", add)
 
-    async def export_selected(self, *, snapshot: bool = False, days: int | None = None, expected_selection: str | None = None, start: datetime | None = None, end: datetime | None = None, chat_ids: list[str] | None = None, password: str | None = None) -> list[dict[str, Any]]:
+    async def export_selected(self, *, snapshot: bool = False, days: int | None = None, expected_selection: str | None = None, start: datetime | None = None, end: datetime | None = None, chat_ids: list[str] | None = None, password: str | None = None, incremental: bool = False) -> list[dict[str, Any]]:
         password = self.archive_password(password)
         from telethon import errors
         inaccessible = (ChatLookupError, errors.ChannelPrivateError, errors.ChatAdminRequiredError,
                         errors.ChatForbiddenError, errors.UserBannedInChannelError,
                         errors.ChannelInvalidError, errors.PeerIdInvalidError)
+        if incremental and (snapshot or days is not None or start is not None or end is not None):
+            raise ValueError("Incremental export cannot be combined with a date range.")
         if days is not None and (snapshot or not 1 <= days <= 3650):
             raise ValueError("Choose a recent period of 1 to 3650 days.")
         if start is not None and (snapshot or days is not None or start.tzinfo is None):
             raise ValueError("Choose a valid start date.")
         if end is not None and (start is None or end.tzinfo is None):
             raise ValueError("Choose a valid end date.")
-        until = (end or _now()) if start is not None else _now() if days is not None else None
-        since = start if start is not None else until - timedelta(days=days) if until is not None else None
-        if since is not None and since > until:
-            raise ValueError("The start date must be before the end date.")
-        independent = snapshot or days is not None or start is not None
-        started_at = _now()
         async def export():
+            self.sync_catalog(internal=True)
             selected = list(self.state["selected"]) if chat_ids is None else catalog.expand_selection(self.state, chat_ids, [])
             if expected_selection is not None and selection_fingerprint(selected) != expected_selection:
                 raise ValueError("The saved selection changed. Refresh the page before exporting.")
             if not selected:
                 raise ValueError("Select at least one chat before exporting.")
+            started_at = _now()
+            until = (end or started_at) if start is not None else started_at if days is not None else None
+            since = start if start is not None else until - timedelta(days=days) if until is not None else None
+            if not snapshot and not incremental and since is None:
+                until = started_at
+                previous = self.state.get("last_selection_exports", {}).get(selection_fingerprint(selected), "")
+                try:
+                    since = datetime.fromisoformat(previous)
+                    if since.tzinfo is None or since > until:
+                        raise ValueError("Invalid previous export date")
+                except (TypeError, ValueError):
+                    since = until - timedelta(days=1)
+            if since is not None and since > until:
+                raise ValueError("The start date must be before the end date.")
+            independent = snapshot or since is not None
             results, failures, completed_chats = [], [], 0
             names = [b["name"] for b in self.state.get("blocks", {}).values() if set(b.get("chat_ids", [])) & set(selected)]
             label = " + ".join(names) if names else (next((d.get("title", "") for d in self.state["dialogs"] if str(d["id"]) == selected[0]), "") if len(selected) == 1 else "selection")
@@ -347,7 +488,7 @@ class DirectService:
                 catalog.write_selected_chats(self.state, listing, selected)
                 _add_to_bundle(bundle, listing, password=password)
                 self.record_archive(bundle)
-                self.state.setdefault("last_selection_exports", {})[selection_fingerprint(selected)] = started_at.isoformat()
+                self.state.setdefault("last_selection_exports", {})[selection_fingerprint(selected)] = (until or started_at).isoformat()
                 self.save()
                 return results
 
@@ -374,8 +515,14 @@ class DirectService:
                 self.record_archive(bundle)
                 result["file"] = source.name
                 result["path"] = str(bundle)
-                dialog["members_exported_at"] = _now().isoformat()
-                catalog.write_catalog(self.state, self.home / "chats.csv")
+                def update(state):
+                    next(d for d in state["dialogs"] if d["id"] == str(chat_id))["members_exported_at"] = _now().isoformat()
+                try:
+                    self.mutate_catalog(update, internal=True)
+                except ValueError as exc:
+                    # The archive is already safely published; preserve an
+                    # external catalog edit and clearly report the missing date.
+                    result["note"] = (result.get("note", "") + " Catalog export date was not updated: " + str(exc)).strip()
                 return result
 
         return await self._run("export group members", export)

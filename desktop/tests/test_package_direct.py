@@ -14,6 +14,23 @@ SPEC.loader.exec_module(package)
 
 class PackageTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX launcher")
+    def test_installed_runtime_is_reused_and_existing_session_is_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "start-linux.sh").write_bytes((ROOT / "start-linux.sh").read_bytes())
+            runtime = root / ".venv-direct" / "bin" / "python"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text("#!/bin/sh\nprintf 'normal: %s\\n' \"$*\"\n")
+            runtime.chmod(0o755)
+            (root / "start-existing-session-linux.sh").write_text("#!/bin/sh\necho existing-session\n")
+            normal = subprocess.run(["sh", str(root / "start-linux.sh")], capture_output=True, text=True)
+            self.assertEqual(normal.returncode, 0)
+            self.assertIn("normal: -m signal_archive telegram", normal.stdout)
+            existing = subprocess.run(["sh", str(root / "start-linux.sh"), "--existing-session"], capture_output=True, text=True)
+            self.assertEqual(existing.returncode, 0)
+            self.assertIn("existing-session", existing.stdout)
+
+    @unittest.skipIf(os.name == "nt", "POSIX launcher")
     def test_linux_launcher_works_when_extraction_drops_executable_bits(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -23,9 +40,16 @@ class PackageTests(unittest.TestCase):
                 archive.extractall(root / "unpacked")
             app = root / "unpacked" / "signal-archive"
             (app / "start-linux.sh").chmod(0o644)
-            result = subprocess.run(["sh", str(app / "run-linux.sh")], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("Run sh install-linux.sh first", result.stderr)
+            bindir = root / "bin"
+            bindir.mkdir()
+            fake_python = bindir / "python3"
+            fake_python.write_text("#!/bin/sh\n/bin/mkdir -p .venv-direct/bin\n/bin/printf '#!/bin/sh\\nprintf \"started: %%s\\n\" \"$*\"\\n' > .venv-direct/bin/python\n/bin/chmod +x .venv-direct/bin/python\n")
+            fake_python.chmod(0o755)
+            env = {**os.environ, "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", "")}
+            result = subprocess.run(["sh", str(app / "run-linux.sh")], capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("First launch", result.stdout)
+            self.assertIn("started: -m signal_archive telegram", result.stdout)
 
     def test_package_contains_only_allowlisted_files_and_never_overwrites(self):
         with tempfile.TemporaryDirectory() as tmp:

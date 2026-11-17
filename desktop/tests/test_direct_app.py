@@ -83,6 +83,117 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("303 See Other", response)
         self.assertEqual(self.service.state["selected"], ["-1001"])
 
+    def test_group_tabs_sort_selected_and_single_chat_preferences_persist(self):
+        ident = catalog.create_block(self.service.state, "Work")
+        catalog.assign_block(self.service.state, ident, ["12"])
+        self.service.state["selected"] = ["12"]
+        page = self.request("GET", "/")
+        self.assertIn("aria-label='Chat groups'", page)
+        self.assertIn("Ungrouped", page)
+        self.assertIn("data-group='" + ident + "'", page)
+        self.assertIn("<dialog id=single-dialog", page)
+        self.assertLess(page.index("data-type='channel'"), page.index("data-type='group'"))
+        form = urlencode({"token": "test-token", "chat_id": "12", "start": "2026-11-01T09:00", "end": "2026-11-02T10:00"})
+        response = self.request("POST", "/single-export", form, {"Origin": "http://127.0.0.1:8765"})
+        self.assertIn("303 See Other", response)
+        self.assertEqual(self.service.state["single_export_settings"]["12"], {"start": "2026-11-01T09:00", "end": "2026-11-02T10:00"})
+        page = self.request("GET", "/")
+        self.assertIn("data-start='2026-11-01T09:00'", page)
+        self.assertIn("data-end='2026-11-02T10:00'", page)
+
+    def test_group_membership_is_separate_from_export_selection(self):
+        group = catalog.create_block(self.service.state, "Work")
+        self.service.state["selected"] = ["12"]
+        catalog.write_catalog(self.service.state, self.service.catalog_path)
+        expected = self.service.catalog_content()[1]
+        origin = {"Origin": "http://127.0.0.1:8765"}
+        form = urlencode({"token": "test-token", "chat_id": "-1001", "group": group, "checked": "yes", "expected_hash": expected})
+        reply = self.request("POST", "/group-membership", form, origin)
+        self.assertIn("200 OK", reply)
+        response = json.loads(reply.split("\r\n\r\n", 1)[1])
+        self.assertEqual(response["groups"], [group])
+        self.assertEqual(self.service.state["selected"], ["12"])
+        self.assertIn("-1001", self.service.state["blocks"][group]["chat_ids"])
+        stale = self.request("POST", "/group-membership", form, origin)
+        self.assertIn("400 Bad Request", stale)
+        ungroup = urlencode({"token": "test-token", "chat_id": "-1001", "group": "ungrouped", "checked": "yes", "expected_hash": response["hash"]})
+        reply = self.request("POST", "/group-membership", ungroup, origin)
+        self.assertIn("200 OK", reply)
+        self.assertEqual(self.service.state["blocks"][group]["chat_ids"], [])
+        self.assertEqual(self.service.state["selected"], ["12"])
+
+    def test_ungrouped_cannot_be_unchecked_without_a_target_group(self):
+        expected = self.service.catalog_content()[1]
+        form = urlencode({"token": "test-token", "chat_id": "12", "group": "ungrouped", "checked": "no", "expected_hash": expected})
+        reply = self.request("POST", "/group-membership", form, {"Origin": "http://127.0.0.1:8765"})
+        self.assertIn("400 Bad Request", reply)
+        self.assertIn("Choose a named group", reply)
+
+    def test_catalog_controls_require_preview_and_show_path(self):
+        page = self.request("GET", "/")
+        self.assertIn(str(self.service.home / "chats.csv"), page)
+        for operation in ("upload", "reload", "restore"):
+            self.assertIn(f"previewCatalog(this,'{operation}')", page)
+        self.assertNotIn("id=catalog-editor", page)
+        self.assertIn("data-page=settings hidden", page)
+
+    def test_external_catalog_edit_shows_conflict_notice(self):
+        self.service.catalog_path.write_text("externally changed", encoding="utf-8")
+        page = self.request("GET", "/")
+        self.assertIn("Cannot apply changes from chats.csv", page)
+        self.assertIn("The file was kept unchanged", page)
+
+    def test_opening_page_applies_valid_external_catalog_edit(self):
+        catalog.write_catalog(self.service.state, self.service.catalog_path)
+        original = self.service.catalog_path.read_text(encoding="utf-8-sig")
+        modified = original.replace("Group & friends", "Renamed group")
+        self.service.catalog_path.write_text(modified, encoding="utf-8-sig")
+        page = self.request("GET", "/")
+        self.assertIn("Renamed group", page)
+        self.assertEqual(self.service.state["dialogs"][0]["title"], "Renamed group")
+        self.assertEqual(self.service.catalog_path.read_text(encoding="utf-8-sig"), modified)
+
+    def test_catalog_preview_save_reload_upload_and_restore(self):
+        catalog.write_catalog(self.service.state, self.service.catalog_path)
+        original, original_hash = self.service.catalog_content()
+        origin = {"Origin": "http://127.0.0.1:8765"}
+        invalid = urlencode({"token": "test-token", "operation": "edit", "csv": "wrong,columns\n1,2"})
+        self.assertIn("400 Bad Request", self.request("POST", "/catalog-preview", invalid, origin))
+        self.assertEqual(self.service.catalog_content()[0], original)
+
+        edited = original.replace("Group & friends", "Work group")
+        preview = urlencode({"token": "test-token", "operation": "edit", "csv": edited})
+        reply = self.request("POST", "/catalog-preview", preview, origin)
+        self.assertIn("200 OK", reply)
+        self.assertEqual(json.loads(reply.split("\r\n\r\n", 1)[1])["hash"], original_hash)
+        save = urlencode({"token": "test-token", "csv": edited, "expected_hash": original_hash})
+        self.assertIn("303 See Other", self.request("POST", "/catalog-edit", save, origin))
+        self.assertEqual(self.service.state["dialogs"][0]["title"], "Work group")
+        backups = self.service.catalog_backups()
+        self.assertTrue(backups)
+
+        current, current_hash = self.service.catalog_content()
+        raced = current.replace("Work group", "External edit")
+        self.service.catalog_path.write_text(raced, encoding="utf-8")
+        stale = urlencode({"token": "test-token", "csv": current, "expected_hash": current_hash})
+        self.assertIn("400", self.request("POST", "/catalog-upload", stale, origin))
+        self.assertIn("External edit", self.service.catalog_path.read_text(encoding="utf-8"))
+        _, external_hash = self.service.catalog_content()
+        reload_form = urlencode({"token": "test-token", "expected_hash": external_hash})
+        self.assertIn("303 See Other", self.request("POST", "/catalog-reload", reload_form, origin))
+        self.assertEqual(self.service.state["dialogs"][0]["title"], "External edit")
+
+        _, current_hash = self.service.catalog_content()
+        upload = urlencode({"token": "test-token", "csv": edited, "expected_hash": current_hash})
+        self.assertIn("303 See Other", self.request("POST", "/catalog-upload", upload, origin))
+        _, current_hash = self.service.catalog_content()
+        restore_preview = urlencode({"token": "test-token", "operation": "restore", "name": backups[0]})
+        reply = self.request("POST", "/catalog-preview", restore_preview, origin)
+        self.assertIn("200 OK", reply)
+        restore = urlencode({"token": "test-token", "name": backups[0], "expected_hash": current_hash})
+        self.assertIn("303 See Other", self.request("POST", "/catalog-restore", restore, origin))
+        self.assertEqual(self.service.state["dialogs"][0]["title"], "Group & friends")
+
     def test_remote_gateway_page_does_not_disclose_pairing_controls_or_codes(self):
         gate = types.SimpleNamespace(pending=lambda: [{"id": "abc", "device_name": "Phone", "approved": False, "code": "123456"}])
         self.runtime.lan_gateway = types.SimpleNamespace(gate=gate, origin="https://host.test:8443", store=types.SimpleNamespace(records={}))
@@ -273,7 +384,7 @@ class WorkspaceTests(unittest.TestCase):
         self.runtime.offline_legacy = True
         page = self.request("GET", "/")
         self.assertIn("Офлайн: старый архив", page)
-        self.assertIn("<section hidden><h2>Choose chats", page)
+        self.assertIn("<section data-page=main hidden data-offline-disabled=yes><h2>Choose chats", page)
         form = urlencode({"token": "test-token"})
         response = self.request("POST", "/refresh", form, {"Origin": "http://127.0.0.1:8765"})
         self.assertIn("400 Bad Request", response)
@@ -496,6 +607,8 @@ class RuntimeTests(unittest.TestCase):
                     async with self.lock:
                         started.set()
                         await asyncio.Event().wait()
+                def catalog_is_current(self):
+                    return True
                 def save(self):
                     pass
             service = Service()

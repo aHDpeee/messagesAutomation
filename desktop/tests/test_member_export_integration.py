@@ -29,7 +29,7 @@ class MemberExportIntegrationTests(unittest.TestCase):
             root = Path(temporary)
             service = DirectService(Client(), root / "state", root / "exports")
             service.state["dialogs"] = [{"id": "123", "type": "group"}]
-            with patch.object(telegram_ops, "Chat", Group), patch("signal_archive.completion_music.play_on_completion"):
+            with patch.object(telegram_ops, "Chat", Group):
                 result = asyncio.run(service.export_members("123"))
             self.assertEqual(result["members_exported"], 2)
             self.assertEqual(service.state["job"]["status"], "success")

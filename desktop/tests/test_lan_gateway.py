@@ -61,6 +61,26 @@ class GatewayTests(unittest.TestCase):
         for path in ("/shutdown", "/encryption", "/instance-shutdown/test", "/shortcut", "/shortcut-offer", "/open-exports", "/autostart", "/retention", "/lan-approve"):
             self.assertIn("403", self.request("POST", path, {}, origin=self.gateway.origin, cookie=cookie))
 
+    def test_catalog_routes_require_paired_device_and_exact_origin(self):
+        from unittest.mock import MagicMock
+        token = self.gateway.sessions.issue("device")
+        cookie = "__Host-signal-session=" + token
+        routes = ("/catalog-preview", "/catalog-edit", "/catalog-upload", "/catalog-reload", "/catalog-restore")
+        for path in routes:
+            self.assertIn("403", self.request("POST", path, {}, origin=self.gateway.origin))
+            self.assertIn("403", self.request("POST", path, {}, origin="https://evil.test", cookie=cookie))
+            response = MagicMock(status=200)
+            response.read.return_value = b'{}'
+            response.getheader.return_value = None
+            connection = MagicMock()
+            connection.getresponse.return_value = response
+            with patch("signal_archive.lan_gateway.http.client.HTTPConnection", return_value=connection):
+                self.assertIn("200", self.request("POST", path, {"token": "csrf"}, origin=self.gateway.origin, cookie=cookie))
+            args, kwargs = connection.request.call_args
+            self.assertEqual(args[:2], ("POST", path))
+            self.assertEqual(kwargs["headers"]["Origin"], "http://127.0.0.1:8765")
+            self.assertIn(b'"token": "csrf"', kwargs["body"])
+
     def test_public_loopback_and_wildcard_bind_are_rejected_before_socket(self):
         from pathlib import Path
         for host in ("0.0.0.0", "127.0.0.1", "8.8.8.8", "169.254.1.2", "example.com"):

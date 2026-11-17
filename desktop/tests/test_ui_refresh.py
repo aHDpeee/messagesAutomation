@@ -84,3 +84,21 @@ class RefreshUiTests(unittest.TestCase):
         self.assertEqual(failed["reloads"], 0)
         self.assertIn("offline", failed["status"])
         self.assertIsNone(failed["stored"])
+
+    def test_group_tabs_show_all_and_do_not_change_export_selection(self):
+        harness = r'''
+const vm = require('vm'), fs = require('fs');
+const checked = {checked:true, addEventListener() {}};
+const chats = [
+  {hidden:false, dataset:{search:'work',type:'group',groups:'team'}, querySelector(){return {checked:false};}},
+  {hidden:false, dataset:{search:'solo',type:'chat',groups:''}, querySelector(){return {checked:false};}},
+];
+const tab = {setAttribute(){}};
+const ctx = {document:{getElementById(id){return {refreshForm:{dataset:{started:''},querySelector(){return {value:'token'}}},search:{value:''},kind:{value:''},status:{},selectionNotice:{}}[id]},querySelectorAll(s){if(s.startsWith('input[type='))return [];if(s.startsWith('.chat input'))return [checked];if(s==='.group-tab')return [tab];if(s==='.chat')return chats;return []}},sessionStorage:{getItem(){return null}},fetch(){return Promise.resolve({json(){return Promise.resolve({})}})},location:{reload(){}},setInterval(){},console};
+vm.runInNewContext(fs.readFileSync(0,'utf8'),ctx);
+ctx.showGroup('team',tab);const team=chats.map(c=>c.hidden);
+ctx.showGroup('ungrouped',tab);const ungrouped=chats.map(c=>c.hidden);
+process.stdout.write(JSON.stringify({team,ungrouped,checked:checked.checked}));
+'''
+        result = subprocess.run(["node", "-e", harness], input=UI_SCRIPT, capture_output=True, text=True, check=True, timeout=5)
+        self.assertEqual(json.loads(result.stdout), {"team": [False, False], "ungrouped": [False, False], "checked": True})

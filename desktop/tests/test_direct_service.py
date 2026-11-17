@@ -12,10 +12,25 @@ from signal_archive.direct_export import ChatLookupError
 
 @unittest.skipUnless(importlib.util.find_spec("telethon"), "Telethon is not installed")
 class DirectServiceTests(unittest.TestCase):
-    def setUp(self):
-        music = patch("signal_archive.completion_music.play_on_completion")
-        music.start()
-        self.addCleanup(music.stop)
+    def test_default_export_bounds_start_and_remembers_selection(self):
+        async def run(root):
+            service = DirectService(None, root, root / "exports")
+            service.state["dialogs"] = [{"id": "1"}]
+            service.select(["1"])
+            times = [datetime(2026, 1, 4, tzinfo=timezone.utc), datetime(2026, 1, 5, tzinfo=timezone.utc)]
+            calls = []
+            async def fake_export(client, chat_id, out_dir, **kwargs):
+                calls.append((kwargs["since"], kwargs["until"], kwargs["after_id"]))
+                return {"last_id": 0, "path": None, "messages": 0}
+            with patch("signal_archive.direct_service._now", side_effect=lambda: times[0]), patch("signal_archive.direct_service.export_chat", fake_export):
+                await service.export_selected()
+                times.pop(0)
+                await service.export_selected()
+            self.assertEqual(calls[0], (datetime(2026, 1, 3, tzinfo=timezone.utc), datetime(2026, 1, 4, tzinfo=timezone.utc), 0))
+            self.assertEqual(calls[1], (datetime(2026, 1, 4, tzinfo=timezone.utc), datetime(2026, 1, 5, tzinfo=timezone.utc), 0))
+            self.assertEqual(service.state["checkpoints"], {})
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(run(Path(tmp)))
 
     def test_add_chat_selects_it_and_preserves_last_activity(self):
         async def run(root):
@@ -78,7 +93,7 @@ class DirectServiceTests(unittest.TestCase):
                 raise UnicodeEncodeError("utf-8", "x", 0, 1, "invalid")
             with patch("signal_archive.direct_service.export_chat", fake_export):
                 with self.assertRaises(UnicodeEncodeError):
-                    await service.export_selected()
+                    await service.export_selected(incremental=True)
             self.assertEqual(calls, [1])
             self.assertEqual(service.state["job"]["status"], "failed")
             self.assertNotIn("failures", service.state["job"])
@@ -100,7 +115,7 @@ class DirectServiceTests(unittest.TestCase):
                 return {"last_id": 10, "path": str(file), "messages": 3}
             with patch("signal_archive.direct_service.export_chat", fake_export), patch("signal_archive.direct_service.asyncio.sleep", new_callable=AsyncMock) as sleep:
                 with self.assertRaises(PartialExportError):
-                    await service.export_selected()
+                    await service.export_selected(incremental=True)
                 sleep.assert_awaited_once_with(3)
             restored = DirectService(None, root, root / "exports")
             self.assertEqual(calls, [1, 2])
@@ -194,7 +209,7 @@ class DirectServiceTests(unittest.TestCase):
 
             with patch("signal_archive.direct_service.export_chat", fake_export), patch("signal_archive.direct_service.asyncio.sleep", new_callable=AsyncMock):
                 with self.assertRaisesRegex(RuntimeError, "offline"):
-                    await service.export_selected()
+                    await service.export_selected(incremental=True)
             restored = DirectService(None, root / "state", root / "exports")
             self.assertEqual(restored.state["checkpoints"], {"1": 42})
             self.assertEqual(restored.state["job"]["status"], "failed")

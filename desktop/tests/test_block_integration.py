@@ -26,7 +26,7 @@ class BlockIntegrationTests(unittest.TestCase):
             with patch('signal_archive.direct_service.export_chat', export), \
                  patch('signal_archive.direct_service.asyncio.sleep', new_callable=AsyncMock), \
                  patch('signal_archive.export_notifications.notify_export_completed'):
-                results = await service.export_selected()
+                results = await service.export_selected(incremental=True)
             with zipfile.ZipFile(results[0]['path']) as archive:
                 names = archive.namelist()
                 self.assertIn('chats.txt', names)

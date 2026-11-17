@@ -17,11 +17,6 @@ from signal_archive.direct_service import DirectService
 
 @unittest.skipUnless(importlib.util.find_spec("telethon"), "Telethon is not installed")
 class DirectWorkflowTests(unittest.TestCase):
-    def setUp(self):
-        music = patch("signal_archive.completion_music.play_on_completion")
-        music.start()
-        self.addCleanup(music.stop)
-
     def test_password_reaches_all_bundle_entries_without_being_saved(self):
         class Client:
             async def get_input_entity(self, chat_id):
@@ -37,7 +32,7 @@ class DirectWorkflowTests(unittest.TestCase):
                 calls.append((source.name, password))
                 bundle.write_bytes(b"mock encrypted zip")
             with patch("signal_archive.encrypted_bundle.add_encrypted_file", encrypted):
-                await app.export_selected(password="test-secret")
+                await app.export_selected(password="test-secret", incremental=True)
             self.assertEqual(len(calls), 2)
             self.assertTrue(all(password == "test-secret" for _, password in calls))
             self.assertNotIn("test-secret", app.state_path.read_text())
@@ -66,12 +61,12 @@ class DirectWorkflowTests(unittest.TestCase):
                 save()
             service.save = crash_before_checkpoint_write
             with self.assertRaises(SimulatedCrash):
-                await service.export_selected()
+                await service.export_selected(incremental=True)
             self.assertEqual(len(list((root / "exports").glob("*.zip"))), 1)
             restored = DirectService(client, root / "state", root / "exports")
             self.assertEqual(restored.state["job"]["status"], "interrupted")
             self.assertNotIn("1", restored.state["checkpoints"])
-            await restored.export_selected()
+            await restored.export_selected(incremental=True)
             files = list((root / "exports").glob("*.zip"))
             self.assertEqual(len(files), 2)  # Duplicate is preferable to a skipped message.
             self.assertEqual([[row["id"] for row in csv.DictReader(io.StringIO(zipfile.ZipFile(p).read(zipfile.ZipFile(p).namelist()[0]).decode("utf-8-sig"))) if row.get("record_type") != "project"] for p in files], [["1"], ["1"]])
@@ -97,7 +92,7 @@ class DirectWorkflowTests(unittest.TestCase):
                 real(bundle, source)
             with patch.object(direct_service, "_add_to_bundle", fail_second):
                 with self.assertRaisesRegex(OSError, "disk full"):
-                    await app.export_selected()
+                    await app.export_selected(incremental=True)
             self.assertEqual(app.state["checkpoints"], {"1": 1})
             bundles = list((root / "exports").iterdir())
             self.assertEqual(len(bundles), 1)
@@ -128,7 +123,7 @@ class DirectWorkflowTests(unittest.TestCase):
             app.state["dialogs"] = [{"id": "1", "title": "Long chat"}]
             app.select(["1"])
             with self.assertRaisesRegex(RuntimeError, "pause until"):
-                await app.export_selected()
+                await app.export_selected(incremental=True)
             self.assertEqual(app.state["checkpoints"], {"1": 1000})
             self.assertEqual(app.state["job"]["completed"], 0)
             files = list((root / "exports").glob("*.zip"))
@@ -139,7 +134,7 @@ class DirectWorkflowTests(unittest.TestCase):
             app.state["cooldown_until"] = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
             app.save()
             client.flood = False
-            results = await app.export_selected()
+            results = await app.export_selected(incremental=True)
             self.assertEqual(client.requests, [(0, 1000), (1000, 1000), (1000, 1000)])
             self.assertEqual(app.state["checkpoints"], {"1": 1001})
             self.assertEqual(app.state["job"]["completed"], 1)
@@ -169,20 +164,20 @@ class DirectWorkflowTests(unittest.TestCase):
             app.state["dialogs"] = [{"id": str(i), "title": str(i)} for i in (1, 2, 3)]
             app.select(["1", "2", "3"])
             with self.assertRaisesRegex(RuntimeError, "pause until"):
-                await app.export_selected()
+                await app.export_selected(incremental=True)
             self.assertEqual(client.requests, [(1, 0), (2, 0)])
             self.assertEqual(app.state["checkpoints"], {"1": 1})
             self.assertEqual(len(list((root / "exports").glob("*.zip"))), 1)
             self.assertFalse(list((root / "exports").glob("*.part")))
             app = DirectService(client, root / "state", root / "exports")
             with self.assertRaisesRegex(RuntimeError, "pause until"):
-                await app.export_selected()
+                await app.export_selected(incremental=True)
             self.assertEqual(client.requests, [(1, 0), (2, 0)])
             # Simulate the passage of the server-requested cooldown.
             app.state["cooldown_until"] = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
             app.save()
             client.flood = False
-            results = await app.export_selected()
+            results = await app.export_selected(incremental=True)
             self.assertEqual(client.requests[2:], [(1, 1), (2, 0), (3, 0)])
             self.assertIsNone(results[0]["path"])
             self.assertEqual(app.state["checkpoints"], {"1": 1, "2": 1, "3": 1})
@@ -228,7 +223,7 @@ class DirectWorkflowTests(unittest.TestCase):
             dialogs = await app.refresh_dialogs()
             self.assertEqual([d["type"] for d in dialogs], ["group", "bot"])
             app.select(["-123", "456"])
-            initial = await app.export_selected()
+            initial = await app.export_selected(incremental=True)
             self.assertEqual(initial[0]["path"], initial[1]["path"])
             with zipfile.ZipFile(initial[0]["path"]) as archive:
                 self.assertEqual(set(archive.namelist()), {initial[0]["file"], initial[1]["file"], "chats.txt"})
@@ -242,7 +237,7 @@ class DirectWorkflowTests(unittest.TestCase):
             client.messages[-123].append(3)
             app = DirectService(client, root / "state", root / "exports")
             app.bind_account(99)
-            incremental = await app.export_selected()
+            incremental = await app.export_selected(incremental=True)
             self.assertEqual([row["id"] for row in records(incremental[0])], ["3"])
             self.assertIsNone(incremental[1]["path"])
             self.assertEqual(incremental[1]["messages"], 0)

@@ -163,7 +163,7 @@ class LanGateway:
 
             def body(self):
                 size = int(self.headers.get("Content-Length", "0"))
-                if not 0 < size <= 1024 * 1024:
+                if not 0 < size <= 8 * 1024 * 1024:
                     raise ValueError("Invalid request size.")
                 return self.rfile.read(size)
 
@@ -206,7 +206,7 @@ class LanGateway:
                     self.reply(400, '{"error":"Request failed or expired. Check approval and try again."}')
 
             def proxy(self, method):
-                if self.path not in ({"/", "/status", "/codex-guide"} if method == "GET" else {"/refresh", "/add-chat", "/export", "/interval", "/cancel", "/members", "/single-export", "/select", "/block-create", "/block-rename", "/block-delete", "/block-assign"}):
+                if self.path not in ({"/", "/status", "/codex-guide"} if method == "GET" else {"/refresh", "/add-chat", "/export", "/interval", "/cancel", "/members", "/single-export", "/select", "/block-create", "/block-rename", "/block-delete", "/block-assign", "/group-membership", "/catalog-preview", "/catalog-edit", "/catalog-upload", "/catalog-reload", "/catalog-restore"}):
                     self.reply(403, '{"error":"Available only on the host computer"}'); return
                 try:
                     body = self.body() if method == "POST" else None
@@ -216,8 +216,8 @@ class LanGateway:
                         headers["Content-Type"] = self.headers.get("Content-Type", "application/x-www-form-urlencoded")
                     conn.request(method, self.path, body=body, headers=headers)
                     response = conn.getresponse()
-                    content = response.read(4 * 1024 * 1024 + 1)
-                    if len(content) > 4 * 1024 * 1024:
+                    content = response.read(16 * 1024 * 1024 + 1)
+                    if len(content) > 16 * 1024 * 1024:
                         raise ValueError("Response too large")
                     self.send_response(response.status)
                     for name in ("Content-Type", "Location", "Cache-Control", "Content-Security-Policy", "X-Content-Type-Options"):

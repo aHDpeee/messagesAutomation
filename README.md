@@ -21,13 +21,12 @@ You need a Telegram account, your own [Telegram API ID and API hash](https://my.
 **Linux:** Install Python 3.10 or newer, then run from the `desktop` folder:
 
 ```sh
-sh install-linux.sh
 sh start-linux.sh
 ```
 
-A Secret Service keyring, such as GNOME Keyring or KDE Wallet, is required. For an existing Linux Telegram Archive session, see [the desktop instructions](desktop/DIRECT_README.md) before using `start-existing-session-linux.sh`.
+A Secret Service keyring, such as GNOME Keyring or KDE Wallet, is required. For an existing Linux Telegram Archive session, see [the desktop instructions](desktop/DIRECT_README.md) before using `sh start-linux.sh --existing-session`.
 
-**Windows:** Install Python 3.10 or newer with the `py` launcher or on PATH. Run `desktop\\install-windows.bat`, then `desktop\\start-windows.bat`. Windows Credential Manager is required. A standalone, windowed executable can be built on Windows as described in [the Windows build guide](desktop/WINDOWS_BUILD.md); its browser-based first run asks for the API credentials and Telegram login. The user of the resulting executable does not need Python.
+**Windows:** Install Python 3.10 or newer with the `py` launcher or on PATH. Run `desktop\\start-windows.bat`; it installs dependencies on first launch. Windows Credential Manager is required. A standalone, windowed executable can be built on Windows as described in [the Windows build guide](desktop/WINDOWS_BUILD.md); its browser-based first run asks for the API credentials and Telegram login. The user of the resulting executable does not need Python.
 
 Select and save chats in the browser interface before exporting. Exports normally go to `Downloads/Signal Archive`. Keep the application open while an export is running; use the Close button in the interface to exit the windowed executable.
 
