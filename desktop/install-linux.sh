@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+set -eu
+cd "$(dirname "$0")"
+command -v python3 >/dev/null || { echo 'Python 3.10 or newer is required.' >&2; exit 1; }
+exec python3 install_runtime.py

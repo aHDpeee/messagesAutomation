@@ -1,0 +1,37 @@
+name: Build Windows executable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build standalone application
+        working-directory: desktop
+        shell: cmd
+        run: build-windows-exe.bat
+      - name: Check executable header and report checksum
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          $exe = 'dist/SignalArchive.exe'
+          if (!(Test-Path $exe)) { throw 'Executable was not created' }
+          $stream = [System.IO.File]::OpenRead($exe)
+          try {
+            if ($stream.Length -lt 1024 -or $stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) { throw 'Invalid executable header' }
+          } finally { $stream.Dispose() }
+          Get-FileHash $exe -Algorithm SHA256 | Format-List
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SignalArchive-Windows
+          path: desktop/dist/SignalArchive.exe
+          if-no-files-found: error
+          retention-days: 7

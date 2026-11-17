@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signal-archive"
+version = "0.3.6"
+description = "Local-first, cross-platform research archive and structured exporter"
+requires-python = ">=3.10"
+dependencies = ["Telethon==1.45.0", "keyring==25.7.0", "pyzipper==0.3.6"]
+
+[project.optional-dependencies]
+lan = ["webauthn==2.7.1"]
+
+[project.scripts]
+signal-archive = "signal_archive.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["signal_archive*"]
