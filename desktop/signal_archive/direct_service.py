@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .direct_export import ChatLookupError, export_chat
-from . import catalog
+from . import catalog, problem_chats
 
 INCREMENTAL_SEGMENT_SIZE = 1000
 
@@ -269,6 +269,25 @@ class DirectService:
     def bind_account(self, account_id: int) -> None:
         account_id = int(account_id)
         existing = self.state.get("account_id")
+        if self.state.get("account_switch_pending"):
+            if existing is not None and int(existing) == account_id:
+                self.state.pop("account_switch_pending", None)
+                self.save()
+                return
+            # A deliberately switched account must never inherit another
+            # account's peer IDs or checkpoints. Preserve a private snapshot
+            # and the previous CSV before changing the active workspace.
+            self.sync_catalog()
+            history = self.home / "account-history"
+            history.mkdir(parents=True, exist_ok=True, mode=0o700)
+            snapshot = history / ("account-" + _now().strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8] + ".json")
+            _write_state(snapshot, self.state)
+            catalog.backup_catalog(self.state, self.catalog_path)
+            def reset_for_new_account(state):
+                state.update(account_id=account_id, dialogs=[], selected=[], blocks={}, checkpoints={}, last_selection_exports={}, problem_chats={})
+                state.pop("account_switch_pending", None)
+            self.mutate_catalog(reset_for_new_account)
+            return
         if existing is None:
             # Existing unbound state may already contain checkpoints from an
             # earlier preview. Do not silently assign them to an unknown account.
@@ -368,17 +387,33 @@ class DirectService:
         return self.state["dialogs"]
 
     async def add_chat(self, reference: str) -> dict[str, Any]:
-        from .chat_add import resolve_chat
+        from .chat_add import resolve_and_join
         async def add():
-            record, method = await resolve_chat(self.client, reference, self.state["dialogs"])
-            ident = str(record["id"])
+            record, method, join = await resolve_and_join(self.client, reference, self.state["dialogs"])
+            ident = str(record["id"]) if record else str(reference)
+            numeric = record is not None and ident.lstrip("-").isdigit()
+            title = str((record or {}).get("title") or reference)
+            kind = str((record or {}).get("type") or "group")
+
             def update(state):
-                dialogs = [d for d in state["dialogs"] if str(d["id"]) != ident] + [record]
-                state["dialogs"] = catalog.merge_dialogs(state, dialogs, method=method)
-                if ident not in state["selected"]:
-                    state["selected"].append(ident)
+                if numeric:
+                    dialogs = [d for d in state["dialogs"] if str(d["id"]) != ident] + [record]
+                    state["dialogs"] = catalog.merge_dialogs(state, dialogs, method=method)
+                    if ident not in state["selected"]:
+                        state["selected"].append(ident)
+                if join["problem"]:
+                    problem_chats.record_problem(state, ident, title=title, kind=kind,
+                                                 reason=join["status"], message=join["message"])
+                else:
+                    # A link can be added before the join is approved and later
+                    # resolve to a numeric chat id; clear both possible keys.
+                    problem_chats.clear_problem(state, reference)
+                    if numeric:
+                        problem_chats.clear_problem(state, ident)
+
             self.mutate_catalog(update, internal=True)
-            return {"id": record["id"], "title": record["title"]}
+            return {"id": ident, "title": title, "reference": reference,
+                    "status": join["status"], "message": join["message"], "problem": join["problem"]}
         return await self._run("add chat", add)
 
     async def export_selected(self, *, snapshot: bool = False, days: int | None = None, expected_selection: str | None = None, start: datetime | None = None, end: datetime | None = None, chat_ids: list[str] | None = None, password: str | None = None, incremental: bool = False) -> list[dict[str, Any]]:
@@ -499,6 +534,7 @@ class DirectService:
         from .telegram_ops import export_group_members
 
         async def export():
+            self.sync_catalog(internal=True)
             dialog = next((d for d in self.state["dialogs"] if d["id"] == str(chat_id)), None)
             if not dialog or dialog["type"] != "group":
                 raise ValueError("Choose a group from the refreshed dialog list.")
@@ -522,6 +558,54 @@ class DirectService:
                 except ValueError as exc:
                     # The archive is already safely published; preserve an
                     # external catalog edit and clearly report the missing date.
+                    result["note"] = (result.get("note", "") + " Catalog export date was not updated: " + str(exc)).strip()
+                return result
+
+        return await self._run("export group members", export)
+
+    async def export_members_batch(self, chat_ids: list[str], *, plan: str = "",
+                                   enrich_profiles: bool = False,
+                                   password: str | None = None) -> dict[str, Any]:
+        """Export members of several groups into one labeled CSV archive."""
+        password = self.archive_password(password)
+        from .telegram_ops import export_group_members_batch
+
+        async def export():
+            self.sync_catalog(internal=True)
+            wanted = list(dict.fromkeys(str(item) for item in chat_ids))
+            by_id = {str(d.get("id")): d for d in self.state["dialogs"]}
+            dialogs = []
+            for ident in wanted:
+                dialog = by_id.get(ident)
+                if not dialog or dialog.get("type") != "group":
+                    continue
+                names = [str(block.get("name")) for block in self.state.get("blocks", {}).values()
+                         if ident in [str(item) for item in block.get("chat_ids", [])] and block.get("name")]
+                dialogs.append({**dialog, "groups": names})
+            if not dialogs:
+                raise ValueError("Выберите хотя бы одну группу из списка чатов.")
+            self.state["job"]["current_members"] = 0
+            def progress(count):
+                self.state["job"]["current_members"] = count
+                self.save()
+            bundle = _new_bundle(self.exports, "members")
+            with tempfile.TemporaryDirectory(prefix="signal-archive-") as staging:
+                result = await export_group_members_batch(self.client, dialogs, Path(staging),
+                                                          plan=plan, enrich_profiles=enrich_profiles,
+                                                          on_progress=progress)
+                source = Path(result["path"])
+                _add_to_bundle(bundle, source, password=password)
+                self.record_archive(bundle)
+                result["file"] = source.name
+                result["path"] = str(bundle)
+                now = _now().isoformat()
+                def update(state):
+                    for dialog in state["dialogs"]:
+                        if str(dialog.get("id")) in result["successful_group_ids"] and dialog.get("type") == "group":
+                            dialog["members_exported_at"] = now
+                try:
+                    self.mutate_catalog(update, internal=True)
+                except ValueError as exc:
                     result["note"] = (result.get("note", "") + " Catalog export date was not updated: " + str(exc)).strip()
                 return result
 

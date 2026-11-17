@@ -37,13 +37,41 @@ class DirectServiceTests(unittest.TestCase):
             service = DirectService(None, root, root / "exports")
             service.state["dialogs"] = [{"id": "1", "title": "Old", "last_message_date": "2026-01-02T00:00:00+00:00"}]
             record = {"id": "1", "title": "Chat", "type": "chat", "last_message_date": ""}
-            with patch("signal_archive.chat_add.resolve_chat", new_callable=AsyncMock, return_value=(record, "username")):
+            join = {"status": "added", "message": "Чат добавлен.", "problem": False}
+            with patch("signal_archive.chat_add.resolve_and_join", new_callable=AsyncMock, return_value=(record, "username", join)):
                 await service.add_chat("@example")
                 await service.add_chat("@example")
             restored = DirectService(None, root, root / "exports")
             self.assertEqual(restored.state["selected"], ["1"])
             self.assertEqual(restored.state["dialogs"][0]["last_message_date"], "2026-01-02T00:00:00+00:00")
             self.assertIn("yes", (root / "chats.csv").read_text(encoding="utf-8-sig"))
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(run(Path(tmp)))
+
+    def test_add_chat_records_join_problem_and_clears_it_on_success(self):
+        async def run(root):
+            service = DirectService(None, root, root / "exports")
+            service.state["dialogs"] = []
+            pending = {"status": "requested", "message": "Ожидает одобрения.", "problem": True}
+            with patch("signal_archive.chat_add.resolve_and_join",
+                       new_callable=AsyncMock, return_value=(None, "invite", pending)) as resolve:
+                result = await service.add_chat("https://t.me/+abc")
+            resolve.assert_awaited_once()
+            self.assertTrue(result["problem"])
+            self.assertEqual(result["status"], "requested")
+            self.assertEqual(result["title"], "https://t.me/+abc")
+            self.assertEqual(service.state["problem_chats"]["https://t.me/+abc"]["reason"], "requested")
+            self.assertEqual(service.state["selected"], [])
+
+            record = {"id": "-1001", "title": "Approved group", "type": "group", "last_message_date": ""}
+            joined = {"status": "joined", "message": "Вы вступили.", "problem": False}
+            with patch("signal_archive.chat_add.resolve_and_join",
+                       new_callable=AsyncMock, return_value=(record, "invite", joined)):
+                result = await service.add_chat("https://t.me/+abc")
+            self.assertFalse(result["problem"])
+            self.assertEqual(service.state["selected"], ["-1001"])
+            self.assertFalse(service.state["problem_chats"])
+            self.assertIn("-1001", [str(item["id"]) for item in service.state["dialogs"]])
         with tempfile.TemporaryDirectory() as tmp:
             asyncio.run(run(Path(tmp)))
 

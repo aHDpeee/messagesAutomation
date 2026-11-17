@@ -63,3 +63,24 @@ class PackageTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 package.build(ROOT, output)
             self.assertEqual(output.read_bytes(), before)
+
+    def test_release_contains_session_and_problem_chat_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "release.zip"
+            package.build(ROOT, output)
+            with zipfile.ZipFile(output) as archive:
+                for module in ("session", "problem_chats"):
+                    self.assertIn(f"signal-archive/signal_archive/{module}.py", archive.namelist())
+
+    def test_unpacked_release_can_import_desktop_entrypoint(self):
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "release.zip"
+            package.build(ROOT, output)
+            with zipfile.ZipFile(output) as archive:
+                archive.extractall(root)
+            app = root / "signal-archive"
+            env = {**os.environ, "PYTHONPATH": str(app)}
+            result = subprocess.run([sys.executable, "-c", "import signal_archive.direct_app, signal_archive.browser_app"], cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)

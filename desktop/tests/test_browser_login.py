@@ -78,6 +78,37 @@ class BrowserLoginTests(unittest.TestCase):
         self.assertIn('303 See Other', response)
         self.assertIn('Location: http://127.0.0.1:8765/', response)
 
+    def wait_for(self, condition):
+        for _ in range(200):
+            if condition():
+                return
+            threading.Event().wait(.001)
+        self.fail('Timed out waiting for the login page to update.')
+
+    def test_fail_shows_error_page_and_reset_choice(self):
+        self.addCleanup(self.login.done.set)
+        worker = threading.Thread(target=self.login.fail, args=('Boom <bad>',))
+        worker.start()
+        self.wait_for(lambda: bool(self.login.error))
+        page = self.request('GET')
+        self.assertIn('Boom &lt;bad&gt;', page)
+        self.assertIn('Сбросить вход и войти заново', page)
+        self.assertIn('Просто закрыть', page)
+        self.assertIn('name="reset" value="yes"', page)
+        self.request('POST', 'reset=yes')
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(self.login.reset_requested)
+
+    def test_fail_close_choice_does_not_request_reset(self):
+        worker = threading.Thread(target=self.login.fail, args=('Problem',))
+        worker.start()
+        self.wait_for(lambda: bool(self.login.error))
+        self.request('POST', 'close=yes')
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(self.login.reset_requested)
+
     def test_telethon_uses_browser_code_and_password_callbacks(self):
         client = SimpleNamespace(start=AsyncMock(), get_me=AsyncMock(return_value='account'))
         prompts = []

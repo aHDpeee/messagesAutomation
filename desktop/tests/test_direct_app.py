@@ -10,6 +10,7 @@ from concurrent.futures import Future
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 from unittest.mock import AsyncMock, patch
@@ -33,10 +34,13 @@ class FakeRuntime:
     def __init__(self, service):
         self.service = service
         self.submitted = []
+        self.shutdown_called = False
     def call(self, operation):
         return operation()
     def submit(self, operation):
         self.submitted.append(operation)
+    def shutdown(self):
+        self.shutdown_called = True
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -226,6 +230,61 @@ class WorkspaceTests(unittest.TestCase):
         with patch.object(self.service, "export_members", new_callable=AsyncMock) as export:
             asyncio.run(self.runtime.submitted[-1]())
         export.assert_awaited_once_with("-1001", enrich_profiles=True, password=None)
+
+    def test_problem_tab_appears_only_with_problems_and_can_be_resolved(self):
+        from signal_archive import problem_chats
+        recent = datetime.now(timezone.utc).isoformat()
+        for dialog in self.service.state["dialogs"]:
+            dialog["last_message_date"] = recent
+        page = self.request("GET", "/")
+        self.assertNotIn("Проблемные чаты (", page)
+        self.assertIn("action=/problem-settings", page)
+        self.assertIn("value='30'", page)
+        self.assertIn("action=/switch-session", page)
+        self.assertIn("action=/members-batch", page)
+        self.assertIn("signal-add-alert", page)
+
+        problem_chats.record_problem(self.service.state, "-300", title="Pending & group",
+                                     kind="group", reason="requested", message="Ожидает одобрения <админом>")
+        page = self.request("GET", "/")
+        self.assertIn("Проблемные чаты (1)", page)
+        self.assertIn("class=\"page-tab problem-tab\"", page)
+        self.assertIn("Pending &amp; group", page)
+        self.assertIn("Ожидает одобрения &lt;админом&gt;", page)
+        self.assertIn("name=problem_chat value=\"-300\"", page)
+        form = urlencode({"token": "test-token", "chat_id": "-300"})
+        self.assertIn("303 See Other", self.request("POST", "/problem-resolve", form,
+                                                    {"Origin": "http://127.0.0.1:8765"}))
+        self.assertNotIn("Проблемные чаты (", self.request("GET", "/"))
+
+    def test_problem_settings_batch_scope_and_session_switch(self):
+        from signal_archive import session as session_ops
+        origin = {"Origin": "http://127.0.0.1:8765"}
+        form = urlencode({"token": "test-token", "days": "7"})
+        self.assertIn("303 See Other", self.request("POST", "/problem-settings", form, origin))
+        self.assertEqual(self.service.state["problem_chat_days"], 7)
+        self.assertIn("value='7'", self.request("GET", "/"))
+        invalid = urlencode({"token": "test-token", "days": "0"})
+        self.assertIn("400 Bad Request", self.request("POST", "/problem-settings", invalid, origin))
+
+        form = urlencode({"token": "test-token", "scope": "all_groups", "plan": "July",
+                          "enrich_profiles": "yes"})
+        self.assertIn("303 See Other", self.request("POST", "/members-batch", form, origin))
+        self.assertTrue(self.runtime.submitted)
+        with patch.object(self.service, "export_members_batch", new_callable=AsyncMock) as export:
+            asyncio.run(self.runtime.submitted[-1]())
+        export.assert_awaited_once_with(["-1001"], plan="July", enrich_profiles=True, password=None)
+
+        form = urlencode({"token": "test-token", "scope": "unknown"})
+        self.assertIn("400 Bad Request", self.request("POST", "/members-batch", form, origin))
+        form = urlencode({"token": "test-token", "scope": "selected_groups"})
+        self.assertIn("400 Bad Request", self.request("POST", "/members-batch", form, origin))
+
+        form = urlencode({"token": "test-token"})
+        reply = self.request("POST", "/switch-session", form, origin)
+        self.assertIn("Локальный вход будет удалён", reply)
+        self.assertTrue(self.runtime.shutdown_called)
+        self.assertTrue(session_ops.switch_requested(self.service.home))
 
     def test_block_create_assign_select_and_escape(self):
         headers = {"Origin": "http://127.0.0.1:8765"}
@@ -424,6 +483,11 @@ class RuntimeTests(unittest.TestCase):
         shortcut = patch('signal_archive.shortcuts.ensure_application_shortcut')
         shortcut.start()
         self.addCleanup(shortcut.stop)
+        # Runtime tests build isolated workspaces; do not attach the developer's
+        # real legacy Telegram Archive session to them.
+        discovery = patch('signal_archive.session.discover_existing_session', return_value=None)
+        discovery.start()
+        self.addCleanup(discovery.stop)
 
     @unittest.skipUnless(importlib.util.find_spec("telethon"), "Telethon is not installed")
     def test_offline_archive_starts_without_credentials_or_telegram_client(self):

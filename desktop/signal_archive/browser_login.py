@@ -21,6 +21,9 @@ class BrowserLogin:
         self.cancelled = False
         self.opened = False
         self.destination = None
+        self.error = ""
+        self.reset_requested = False
+        self.done = threading.Event()
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -45,7 +48,17 @@ class BrowserLogin:
                     self.reply(404, 'Not found')
                     return
                 with owner.condition:
-                    label, stage, secret, destination = owner.label, owner.stage, owner.secret, owner.destination
+                    label, stage, secret, destination, error = owner.label, owner.stage, owner.secret, owner.destination, owner.error
+                if error:
+                    self.reply(200, '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+                        '<title>Signal Archive — error</title><style>body{font:16px/1.5 system-ui;background:#0c1520;color:#edf5f8;max-width:620px;margin:8vh auto;padding:24px}'
+                        'main{background:#172331;padding:28px;border-radius:16px;border:1px solid #8c2f2f}button{padding:12px 20px;margin:8px 8px 0 0;background:#65d6c0;border:0;border-radius:8px;font-weight:bold}'
+                        'button.secondary{background:#263c4d;color:#edf5f8}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>'
+                        '<main><h1>Signal Archive</h1><p>Не удалось запустить приложение. Ничего не удалено без вашего выбора.</p>'
+                        '<pre>' + html.escape(error) + '</pre><form method="post"><input type="hidden" name="reset" value="yes">'
+                        '<button>Сбросить вход и войти заново</button></form>'
+                        '<form method="post"><input type="hidden" name="close" value="yes"><button class=secondary>Просто закрыть</button></form></main>')
+                    return
                 if destination:
                     self.send_response(303)
                     self.send_header('Location', destination)
@@ -78,6 +91,15 @@ class BrowserLogin:
                             owner.cancelled = True
                             owner.condition.notify_all()
                         self.reply(200, 'Sign-in cancelled. You can close this tab.')
+                        return
+                    if data.get('reset') == ['yes']:
+                        owner.reset_requested = True
+                        owner.done.set()
+                        self.reply(200, 'Локальный вход будет сброшен. Перезапустите Signal Archive.')
+                        return
+                    if data.get('close') == ['yes']:
+                        owner.done.set()
+                        self.reply(200, 'You can close this tab.')
                         return
                     stage = int(data['stage'][0])
                     value = data['value'][0]
@@ -130,6 +152,16 @@ class BrowserLogin:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+
+    def fail(self, message):
+        """Show a local error page and wait for the user's choice."""
+        if not self.opened:
+            self.open()
+        with self.condition:
+            self.error = str(message)
+            self.destination = None
+            self.condition.notify_all()
+        self.done.wait()
 
     def finish(self, destination):
         with self.condition:

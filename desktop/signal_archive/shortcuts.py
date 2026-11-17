@@ -22,12 +22,15 @@ def desktop_directory() -> Path:
 def launcher_command(home: Path, exports: Path, external_session: bool = False) -> list[str]:
     if getattr(sys, 'frozen', False):
         return [sys.executable, '--open-existing', '--home', str(home), '--exports', str(exports)]
-    base = Path(__file__).resolve().parent.parent
-    if external_session:
-        launch = ['sh', str(base / 'start-existing-session-linux.sh')]
-    else:
-        launch = [sys.executable, '-m', 'signal_archive', '--home', str(home), 'telegram', '--exports', str(exports)]
-    return [sys.executable, '-m', 'signal_archive.shortcut_launcher', '--home', str(home), '--', *launch]
+    # The legacy session is discovered automatically at startup, so shortcuts
+    # always use the normal launcher and need no special session flag.
+    launch = [sys.executable, '-m', 'signal_archive', '--home', str(home), 'telegram', '--exports', str(exports)]
+    # A desktop shortcut starts in an arbitrary directory.  Change to the
+    # source checkout before importing the launcher, so it and its child use
+    # the current application rather than an older copy installed in the venv.
+    bootstrap = ('import os,sys; os.chdir(sys.argv.pop(1)); '
+                 'from signal_archive.shortcut_launcher import main; main()')
+    return [sys.executable, '-c', bootstrap, str(application_directory()), '--home', str(home), '--', *launch]
 
 
 def application_directory() -> Path:

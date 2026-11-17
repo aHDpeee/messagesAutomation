@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .direct_service import DirectService, _write_state, selection_fingerprint
-from . import autostart, legacy_archive, catalog
+from . import autostart, legacy_archive, catalog, problem_chats, session as session_ops
 
 SERVICE = "SignalArchiveDirect"
 
@@ -193,6 +193,15 @@ function update() {
         if (refreshReady) t += '\nThe new chat list is ready. Save your selection to show it.';
         else if (j.status === 'success' && j.name === 'refresh dialogs') t += '\nRefresh the page to see the new list.';
         document.getElementById('status').textContent = t;
+        let alerted = '';
+        try { alerted = sessionStorage.getItem('signal-add-alert') || ''; } catch (_) {}
+        if (j.name === 'add chat' && j.started_at && j.started_at !== alerted && j.status !== 'running') {
+            const message = (j.result && j.result.message) || (j.status === 'failed' ? j.error : '');
+            if (message && (j.status === 'failed' || (j.result && j.result.problem))) {
+                if (typeof alert === 'function') alert(message);
+                try { sessionStorage.setItem('signal-add-alert', j.started_at); } catch (_) {}
+            }
+        }
     }).catch(() => document.getElementById('status').textContent = 'Cannot reach the application.');
 }
 update();
@@ -315,28 +324,47 @@ class SessionLock:
         self.file.close()
 
 
+def _forget_login_unlocked(home: Path) -> None:
+    """Remove local credentials; the caller must hold the workspace session lock."""
+    if not home.exists():
+        raise ValueError("Workspace does not exist.")
+    config = home / "account.json"
+    if config.is_symlink():
+        raise RuntimeError("Refusing a symbolic link for account.json.")
+    data = json.loads(config.read_text(encoding="utf-8")) if config.exists() else {}
+    account = _secret_account(home)
+    if data.get("keyring_account") not in (None, account):
+        raise RuntimeError("Workspace path changed; refusing to remove another workspace's keyring entry.")
+    kr = _keyring()
+    if kr.get_password(SERVICE, account) is not None:
+        kr.delete_password(SERVICE, account)
+        if kr.get_password(SERVICE, account) is not None:
+            raise RuntimeError("The OS keyring did not remove the API Hash.")
+    # Do not remove the legacy shared keyring entry: another old workspace
+    # may still depend on it. Its removal requires separate inspection.
+    for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+        (home / ("telegram" + suffix)).unlink(missing_ok=True)
+    config.unlink(missing_ok=True)
+
+
 def forget_telegram_login(home: Path) -> None:
     """Remove this workspace's local credentials while preserving export state."""
     if not home.exists():
         raise ValueError("Workspace does not exist.")
     with SessionLock(home / "session.lock"):
-        config = home / "account.json"
-        if config.is_symlink():
-            raise RuntimeError("Refusing a symbolic link for account.json.")
-        data = json.loads(config.read_text(encoding="utf-8")) if config.exists() else {}
-        account = _secret_account(home)
-        if data.get("keyring_account") not in (None, account):
-            raise RuntimeError("Workspace path changed; refusing to remove another workspace's keyring entry.")
-        kr = _keyring()
-        if kr.get_password(SERVICE, account) is not None:
-            kr.delete_password(SERVICE, account)
-            if kr.get_password(SERVICE, account) is not None:
-                raise RuntimeError("The OS keyring did not remove the API Hash.")
-        # Do not remove the legacy shared keyring entry: another old workspace
-        # may still depend on it. Its removal requires separate inspection.
-        for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
-            (home / ("telegram" + suffix)).unlink(missing_ok=True)
-        config.unlink(missing_ok=True)
+        _forget_login_unlocked(home)
+
+
+def finish_session_switch(home: Path, service: DirectService | None = None) -> None:
+    """Apply a requested session switch while this process owns the lock."""
+    if not session_ops.switch_requested(home):
+        return
+    if service is not None:
+        service.state["session_source"] = "own"
+        service.state["account_switch_pending"] = True
+        service.save()
+    _forget_login_unlocked(home)
+    session_ops.clear_session_switch(home)
 
 
 class Runtime:
@@ -506,6 +534,7 @@ def make_handler(runtime: Runtime, token: str):
                         service.catalog_sync_error = str(exc)
             runtime.call(sync_visible_catalog)
             state = runtime.call(lambda: json.loads(json.dumps(runtime.service.state)))
+            problems = problem_chats.classify_problems(state)
             offline = getattr(runtime, "offline_legacy", False)
             hidden_live = "hidden" if offline else ""
             offline_disabled = "data-offline-disabled=yes" if offline else ""
@@ -552,9 +581,10 @@ def make_handler(runtime: Runtime, token: str):
             encryption_checked = "checked" if state.get("encryption_enabled") else ""
             member_enrichment_checked = "checked" if state.get("member_enrichment_enabled") else ""
             retention_days = int(retention.get("days", 30))
+            problem_days_value = problem_chats.problem_days(state)
             checked = "checked" if schedule.get("enabled") else ""
             startup_checked = "checked" if autostart.enabled() else ""
-            startup_note = ("Для старой сессии используйте start-existing-session-linux.sh; обычный автозапуск её не поддерживает. Если он включён, снимите галочку и сохраните настройку." if getattr(runtime, "external_session", False) else "Automatic startup opens a terminal so that authorization or keyring errors are visible.")
+            startup_note = ("Старая сессия Telegram Archive обнаруживается автоматически. Чтобы войти под другим аккаунтом, нажмите «Сменить сессию»." if getattr(runtime, "external_session", False) else "При запуске используется сохранённая сессия; сменить её можно кнопкой «Сменить сессию».")
             shortcut_offer = (f"<section><h2>Desktop shortcut</h2><p>Add Signal Archive to your desktop for quick access?</p><form method=post action=/shortcut-offer><input type=hidden name=token value='{token}'><button name=choice value=yes>Add shortcut</button> <button name=choice value=no>Not now</button></form><small>You can create it later under Shortcuts and access.</small></section>" if not state.get('shortcut_offer_answered') and not offline else '')
             gateway = getattr(runtime, "lan_gateway", None)
             if gateway:
@@ -631,19 +661,59 @@ def make_handler(runtime: Runtime, token: str):
                 old_archive_html = f"<section><h2>Старый архив не найден</h2><p>{html.escape(str(legacy_archive.DEFAULT_DB))}</p></section>"
             password_field = "<label>ZIP password (optional) <input type=password name=archive_password autocomplete=new-password></label>"
             lan_section = "" if self.headers.get("X-Signal-Remote") == "1" else f"<details data-page=settings hidden><summary>LAN access and paired devices</summary>{lan_html}</details>"
+
+            stored_problems = {str(key) for key in state.get("problem_chats", {})}
+            def problem_row(item):
+                ident = html.escape(str(item["id"]), quote=True)
+                title = html.escape(str(item["title"]))
+                kind = html.escape(str(item["type"]))
+                message = html.escape(str(item["message"]))
+                groups = html.escape(", ".join(item["groups"]))
+                choose = (f'<label><input type=checkbox name=problem_chat value="{ident}"> В экспорт участников</label>'
+                          if item["selectable"] else "")
+                resolve = ""
+                if str(item["id"]) in stored_problems:
+                    resolve = (f'<form method=post action=/problem-resolve><input type=hidden name=token value="{token}">'
+                               f'<input type=hidden name=chat_id value="{ident}"><button class=secondary>Убрать</button></form>')
+                return (f'<div class=problem-row><span><b>{title}</b> <small>{kind}'
+                        + (f" · {groups}" if groups else "") + f'</small><br><small class=problem-reason>{message}</small></span>'
+                        + f'<span>{choose}{resolve}</span></div>')
+
+            def problem_list(items, empty):
+                return "".join(problem_row(item) for item in items) or f"<p><small>{empty}</small></p>"
+
+            if problems["all"]:
+                problem_tab = (f'<button class="page-tab problem-tab" data-target=problems aria-selected=false '
+                               f'onclick="showPage(\'problems\')">Проблемные чаты ({len(problems["all"])})</button>')
+                problem_section = (
+                    f'<section data-page=problems {offline_disabled}><h2>Проблемные чаты</h2>'
+                    '<p>Красная вкладка появляется только когда есть чаты, требующие внимания.</p>'
+                    '<h3>Требуют внимания</h3><p><small>Не ответившие боты, чаты с 0 сообщений и группы/каналы с неподтверждённым запросом на вступление.</small></p>'
+                    f'<div class=chat-list>{problem_list(problems["urgent"], "Проблем пока нет.")}</div>'
+                    f'<h3>Нет сообщений больше {problems["days"]} дней</h3>'
+                    f'<div class=chat-list>{problem_list(problems["stale"], "Таких чатов нет.")}</div>'
+                    f'<form method=post action=/members-batch><input type=hidden name=token value="{token}">'
+                    f'<input type=hidden name=scope value=problem>'
+                    f'<label><input type=checkbox name=enrich_profiles value=yes {member_enrichment_checked}> Биографии и каналы (медленнее)</label> '
+                    f'<label>Метка плана <input name=plan placeholder="необязательно" maxlength=200></label> '
+                    '<button>Экспорт участников выбранных здесь групп</button></form></section>')
+            else:
+                problem_tab = ""
+                problem_section = ""
             self.send(f'''<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Signal Archive</title><style>
-            :root{{color-scheme:dark;--panel:#172331;--line:#304357;--muted:#a7bbcb;--accent:#65d6c0}}*{{box-sizing:border-box}}body{{font:16px/1.5 system-ui,sans-serif;background:#0c1520;color:#edf5f8;max-width:1000px;margin:auto;padding:28px}}h1{{font-size:2rem;margin-bottom:0}}h2{{font-size:1.2rem;margin-top:0}}h3{{font-size:1rem}}section{{background:var(--panel);padding:22px;border:1px solid var(--line);border-radius:16px;margin:16px 0;box-shadow:0 8px 24px #0003}}button,input,select{{font:inherit}}button{{background:var(--accent);color:#07231e;border:0;border-radius:9px;padding:10px 16px;font-weight:650;cursor:pointer}}button:hover{{filter:brightness(1.12)}}button.secondary{{background:#263c4d;color:#e6f4f5}}input:not([type=checkbox]),select{{background:#101d2a;color:inherit;border:1px solid #52697b;border-radius:8px;padding:9px}}input[type=checkbox]{{accent-color:var(--accent);width:18px;height:18px;vertical-align:middle}}.chat-list{{max-height: min(55vh, 32rem);overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column}}.recent-list{{max-height:12rem;overflow-y:auto;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:10px}}.recent-list ul{{padding-right:16px}}.chat{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-bottom:1px solid var(--line)}}.chat label{{display:flex;align-items:center;gap:10px}}.chat-title{{display:flex;align-items:center;gap:10px;flex:1;min-width:0}}.chat:last-child{{border-bottom:0}}.chat:has(input[name="chat"]:checked){{order:-1}}dialog{{background:var(--panel);color:inherit;border:1px solid var(--line);border-radius:16px;max-width:min(95vw,600px)}}dialog::backdrop{{background:#000a}}.tabs{{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}}[aria-selected=true]{{outline:2px solid white}}[hidden]{{display:none!important}}small{{color:var(--muted)}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}.activity{{border-color:var(--accent)}}#status{{background:#0e1b27;padding:14px;border-radius:9px;margin:0 0 12px}}a{{color:#83e4d2;text-decoration:none}}a:hover{{text-decoration:underline}}summary{{cursor:pointer;color:#a1ddd3;margin-top:16px}}@media(max-width:600px){{body{{padding:12px}}section{{padding:16px}}.chat{{align-items:flex-start;flex-wrap:wrap}}}}
-            </style></head><body><h1>Signal Archive</h1><p>Text-only Telegram exports on this computer. <a href='/codex-guide' title='Codex archive analysis guide'>(i) Codex guide</a></p>{offline_notice}<nav class=tabs role=tablist aria-label='Pages'><button class=page-tab data-target=main aria-selected=true onclick="showPage('main')">Chats and export</button><button class=page-tab data-target=settings aria-selected=false onclick="showPage('settings')">Settings</button></nav>
+            :root{{color-scheme:dark;--panel:#172331;--line:#304357;--muted:#a7bbcb;--accent:#65d6c0}}*{{box-sizing:border-box}}body{{font:16px/1.5 system-ui,sans-serif;background:#0c1520;color:#edf5f8;max-width:1000px;margin:auto;padding:28px}}h1{{font-size:2rem;margin-bottom:0}}h2{{font-size:1.2rem;margin-top:0}}h3{{font-size:1rem}}section{{background:var(--panel);padding:22px;border:1px solid var(--line);border-radius:16px;margin:16px 0;box-shadow:0 8px 24px #0003}}button,input,select{{font:inherit}}button{{background:var(--accent);color:#07231e;border:0;border-radius:9px;padding:10px 16px;font-weight:650;cursor:pointer}}button:hover{{filter:brightness(1.12)}}button.secondary{{background:#263c4d;color:#e6f4f5}}input:not([type=checkbox]),select{{background:#101d2a;color:inherit;border:1px solid #52697b;border-radius:8px;padding:9px}}input[type=checkbox]{{accent-color:var(--accent);width:18px;height:18px;vertical-align:middle}}.chat-list{{max-height: min(55vh, 32rem);overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column}}.recent-list{{max-height:12rem;overflow-y:auto;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:10px}}.recent-list ul{{padding-right:16px}}.chat{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-bottom:1px solid var(--line)}}.chat label{{display:flex;align-items:center;gap:10px}}.chat-title{{display:flex;align-items:center;gap:10px;flex:1;min-width:0}}.chat:last-child{{border-bottom:0}}.chat:has(input[name="chat"]:checked){{order:-1}}dialog{{background:var(--panel);color:inherit;border:1px solid var(--line);border-radius:16px;max-width:min(95vw,600px)}}dialog::backdrop{{background:#000a}}.tabs{{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}}[aria-selected=true]{{outline:2px solid white}}.problem-tab{{background:#8c2f2f;color:#fff;font-weight:750}}.problem-tab[aria-selected=true]{{outline:3px solid #ff9b9b}}.problem-row{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px;border-bottom:1px solid var(--line)}}.problem-row:last-child{{border-bottom:0}}.problem-reason{{color:#ffb3b3}}[hidden]{{display:none!important}}small{{color:var(--muted)}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}.activity{{border-color:var(--accent)}}#status{{background:#0e1b27;padding:14px;border-radius:9px;margin:0 0 12px}}a{{color:#83e4d2;text-decoration:none}}a:hover{{text-decoration:underline}}summary{{cursor:pointer;color:#a1ddd3;margin-top:16px}}@media(max-width:600px){{body{{padding:12px}}section{{padding:16px}}.chat{{align-items:flex-start;flex-wrap:wrap}}}}
+            </style></head><body><h1>Signal Archive</h1><p>Text-only Telegram exports on this computer. <a href='/codex-guide' title='Codex archive analysis guide'>(i) Codex guide</a></p>{offline_notice}<nav class=tabs role=tablist aria-label='Pages'><button class=page-tab data-target=main aria-selected=true onclick="showPage('main')">Chats and export</button>{problem_tab}<button class=page-tab data-target=settings aria-selected=false onclick="showPage('settings')">Settings</button></nav>
             {shortcut_offer}{catalog_conflict}<section class=activity><h2>Latest activity</h2><pre id=status role=status aria-live=polite>Checking activity…</pre><form method=post action=/cancel><input type=hidden name=token value='{token}'><button class=secondary>Stop current operation</button></form><small>Progress updates automatically. Completed files stay in the export folder.</small><form method=post action=/shutdown onsubmit="return confirm('Close Signal Archive? Any running export will stop.')"><input type=hidden name=token value='{token}'><p><button class=secondary>Close Signal Archive</button></p></form></section>{lan_section}
             <details data-page=settings hidden><summary>Shortcuts and access</summary><p>Create a shortcut to start Signal Archive or open its existing browser interface.</p><form method=post action=/shortcut><input type=hidden name=token value='{token}'><button name=location value=desktop>Create desktop shortcut</button> <button name=location value=application>Create shortcut in application folder</button></form><small>The preview uses a browser for compatibility. The interface is currently accessible only on this computer. <a href='https://qna.habr.com/q/800445' target=_blank rel='noopener noreferrer'>About local network access</a></small></details>
-            <section data-page=main {hidden_live} {offline_disabled}><h2>Export</h2><p>{len(chosen)} chats selected. No media files are downloaded.</p><form method=post action=/export onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> <button>Export through now</button></form><details><summary>More export options</summary><p>Choose a specific time interval.</p><form method=post action=/interval onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> <label>To <input type=datetime-local name=end required></label> <button>Export interval</button></form></details><p>Files: {html.escape(str(runtime.service.exports))}</p><form method=post action=/open-exports><input type=hidden name=token value='{token}'><button>Open export folder</button></form><h3>Most recent successful exports</h3><div class=recent-list tabindex=0 aria-label="Most recent successful exports"><ul>{last_export_html or '<li>No successful export yet.</li>'}</ul></div></section>
+            <section data-page=main {hidden_live} {offline_disabled}><h2>Export</h2><p>{len(chosen)} chats selected. No media files are downloaded.</p><form method=post action=/export onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> <button>Export through now</button></form><details><summary>More export options</summary><p>Choose a specific time interval.</p><form method=post action=/interval onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> <label>To <input type=datetime-local name=end required></label> <button>Export interval</button></form></details><p>Files: {html.escape(str(runtime.service.exports))}</p><form method=post action=/open-exports><input type=hidden name=token value='{token}'><button>Open export folder</button></form><form method=post action=/members-batch><input type=hidden name=token value='{token}'><label><input type=checkbox name=enrich_profiles value=yes {member_enrichment_checked}> Also fetch bios and personal channels (slower)</label> <label>Plan <input name=plan placeholder='optional' maxlength=200></label> <button name=scope value=all_groups>Export members of all groups</button> <button class=secondary name=scope value=selected_groups>Export members of selected groups</button></form><h3>Most recent successful exports</h3><div class=recent-list tabindex=0 aria-label="Most recent successful exports"><ul>{last_export_html or '<li>No successful export yet.</li>'}</ul></div></section>
             {old_archive_html}
-            <section data-page=settings hidden><h2>Schedule</h2><form method=post action=/schedule><input type=hidden name=token value='{token}'><label><input type=checkbox name=enabled value=yes {checked}> Daily while the app is running</label> <input type=time name=time value='{selected_time}' required> <button>Save schedule</button></form><small>If the app was closed at the scheduled time, it runs when reopened.</small><form method=post action=/encryption><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {encryption_checked}> Password-protect all new ZIP archives</label> <input type=password name=password autocomplete=new-password placeholder="Archive password"> <button>Save encryption</button></p><small>Stored in the OS keyring for scheduled exports. AES ZIP needs a compatible archive reader.</small></form><form method=post action=/retention><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {retention_checked}> Delete app-created archives older than</label> <input type=number name=days min=1 max=36500 value='{retention_days}' required> days <button>Save retention</button></p></form><form method=post action=/autostart><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {startup_checked}> Start Signal Archive when I sign in</label> <button>Save startup setting</button></p></form><small>{html.escape(startup_note)}</small></section>
+            <section data-page=settings hidden><h2>Schedule</h2><form method=post action=/schedule><input type=hidden name=token value='{token}'><label><input type=checkbox name=enabled value=yes {checked}> Daily while the app is running</label> <input type=time name=time value='{selected_time}' required> <button>Save schedule</button></form><small>If the app was closed at the scheduled time, it runs when reopened.</small><form method=post action=/encryption><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {encryption_checked}> Password-protect all new ZIP archives</label> <input type=password name=password autocomplete=new-password placeholder="Archive password"> <button>Save encryption</button></p><small>Stored in the OS keyring for scheduled exports. AES ZIP needs a compatible archive reader.</small></form><form method=post action=/retention><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {retention_checked}> Delete app-created archives older than</label> <input type=number name=days min=1 max=36500 value='{retention_days}' required> days <button>Save retention</button></p></form><form method=post action=/problem-settings><input type=hidden name=token value='{token}'><p><label>чаты в проблемные через N дней <input type=number name=days min=1 max=3650 value='{problem_days_value}' required></label> <button>Сохранить</button></p></form><form method=post action=/switch-session onsubmit="return confirm('Сменить сессию? Приложение закроется. При смене аккаунта прежний список чатов будет сохранён в резервной копии, а для нового аккаунта создан отдельный список. Экспорты сохранятся.')"><input type=hidden name=token value='{token}'><p><button class=secondary>Сменить сессию</button> <small>Использовать другую сессию или аккаунт; старый файл Telegram Archive не удаляется.</small></p></form><form method=post action=/autostart><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {startup_checked}> Start Signal Archive when I sign in</label> <button>Save startup setting</button></p></form><small>{html.escape(startup_note)}</small></section>
 
             <section data-page=main {hidden_live} {offline_disabled}><h2>Choose chats</h2><form id=refreshForm data-started='{last_started}' method=post action=/refresh onsubmit='return rememberRefresh()'><input type=hidden name=token value='{token}'><button>Refresh Telegram chats</button></form><form method=post action=/add-chat onsubmit="return rememberRefresh('add chat')"><input type=hidden name=token value='{token}'><input name=reference placeholder='Chat link, @username, ID or name' required><button>Add chat</button></form><p id=selectionNotice role=status></p><p><input id=search placeholder='Search chats' oninput='filter()'></p><p><button type=button onclick='selectVisible(true)'>Select visible</button> <button type=button onclick='selectVisible(false)'>Clear visible</button></p>
             <small>Member lists contain only data visible to your account.</small>
             <dialog id=single-dialog aria-labelledby=single-chat-title><h2 id=single-chat-title>Export chat</h2><form id=single-export method=post action=/single-export><input type=hidden name=token value='{token}'><input id=single-chat-id type=hidden name=chat_id><p><label>From <input id=single-start type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label></p><p><label>To (leave blank for now) <input id=single-end type=datetime-local name=end></label></p>{password_field}<p><button>Export chat</button> <button type=button class=secondary onclick="document.getElementById('single-dialog').close()">Cancel</button></p><small>Dates are remembered for this chat. Passwords are not saved here.</small></form></dialog><p>Chat catalog: {html.escape(str(runtime.service.home / 'chats.csv'))}</p>
             <p>Selected chats are shown first. The export checkbox is kept in the catalog instead of being shown here; use <b>Select visible</b>, <b>Clear visible</b>, <b>Select whole blocks</b> or edit <code>chats.csv</code> to change it. Check <b>In this group</b> to change group membership.</p><nav class=tabs role=tablist aria-label='Chat groups'><button type=button class=group-tab role=tab aria-selected=true onclick="showGroup('ungrouped',this)">Ungrouped</button>{group_tabs}</nav><p id=group-notice role=status></p><input id=group-catalog-hash type=hidden value='{catalog_hash}'><form method=post action=/select><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><p>Select whole blocks: {block_select_html or 'No blocks yet.'}</p><div class=chat-list tabindex=0 aria-label='Chat list'>{''.join(rows) or '<p>Refresh the list to see your Telegram chats.</p>'}</div><p><button>Save selection</button></p></form></section>
+            {problem_section}
             <section data-page=settings hidden><h2>Chat catalog</h2><p>CSV file: <code>{html.escape(str(runtime.service.home / 'chats.csv'))}</code></p><p id=catalog-status role=status>{catalog_notice}</p>
             <p>Groups are stored per chat in the CSV <code>blocks</code> column. Enter one name or several names separated by commas; leave it empty for Ungrouped. For a group name containing a comma, use a JSON list such as <code>[&quot;Work, projects&quot;]</code>. The <code>type</code> column is the Telegram chat type, not the group. Replace or save the CSV and refresh this page to apply valid changes; you can also upload a CSV below. Invalid files are kept unchanged and reported.</p>
             <form method=post action=/catalog-reload onsubmit="previewCatalog(this,'reload'); return false"><input type=hidden name=token value='{token}'><input type=hidden name=expected_hash value='{catalog_hash}'><button>Reload from local CSV</button></form>
@@ -671,7 +741,7 @@ def make_handler(runtime: Runtime, token: str):
                 form = parse_qs(self.rfile.read(size).decode("utf-8"))
                 if not secrets.compare_digest(form.get("token", [""])[0], token):
                     self.send("Invalid token", 403); return
-                if getattr(runtime, "offline_legacy", False) and self.path not in {"/legacy-export", "/open-exports", "/cancel", "/shutdown"}:
+                if getattr(runtime, "offline_legacy", False) and self.path not in {"/legacy-export", "/open-exports", "/cancel", "/shutdown", "/switch-session"}:
                     raise ValueError("В офлайн-режиме доступен только старый локальный архив.")
                 if self.path == "/group-membership":
                     def change_membership():
@@ -830,6 +900,51 @@ def make_handler(runtime: Runtime, token: str):
                     runtime.call(remember_member_settings)
                     password = form.get('archive_password', [''])[0] or None
                     runtime.submit(lambda: runtime.service.export_members(chat_id, enrich_profiles=enrich_profiles, password=password))
+                elif self.path == "/members-batch":
+                    scope = form.get("scope", [""])[0]
+                    if scope not in {"all_groups", "selected_groups", "problem"}:
+                        raise ValueError("Выберите, какие группы экспортировать.")
+                    def member_ids():
+                        runtime.service.sync_catalog()
+                        state = runtime.service.state
+                        if scope == "all_groups":
+                            ids = [str(d["id"]) for d in state["dialogs"] if d.get("type") == "group"]
+                        elif scope == "selected_groups":
+                            groups = {str(d["id"]) for d in state["dialogs"] if d.get("type") == "group"}
+                            ids = [str(item) for item in state["selected"] if str(item) in groups]
+                        else:
+                            allowed = {item["id"] for item in problem_chats.classify_problems(state)["all"] if item["selectable"]}
+                            ids = list(form.get("problem_chat", []))
+                            if any(item not in allowed for item in ids):
+                                raise ValueError("Выберите группы из вкладки проблемных чатов.")
+                        return [str(int(item)) for item in dict.fromkeys(ids) if str(item).lstrip("-").isdigit()]
+                    ids = runtime.call(member_ids)
+                    if not ids:
+                        raise ValueError("В выбранной области нет групп.")
+                    enrich_profiles = form.get("enrich_profiles", [""])[0] == "yes"
+                    plan = form.get("plan", [""])[0]
+                    password = form.get("archive_password", [""])[0] or None
+                    runtime.submit(lambda: runtime.service.export_members_batch(
+                        ids, plan=plan, enrich_profiles=enrich_profiles, password=password))
+                elif self.path == "/problem-settings":
+                    days = int(form.get("days", ["30"])[0])
+                    if not 1 <= days <= 3650:
+                        raise ValueError("Выберите период от 1 до 3650 дней.")
+                    def save_problem_days():
+                        runtime.service.state["problem_chat_days"] = days
+                        runtime.service.save()
+                    runtime.call(save_problem_days)
+                elif self.path == "/problem-resolve":
+                    ident = form.get("chat_id", [""])[0]
+                    def resolve_problem():
+                        problem_chats.clear_problem(runtime.service.state, ident)
+                        runtime.service.save()
+                    runtime.call(resolve_problem)
+                elif self.path == "/switch-session":
+                    session_ops.request_session_switch(runtime.service.home)
+                    self.send("<!doctype html><meta charset=utf-8><title>Signal Archive</title><p>Локальный вход будет удалён, приложение закроется. Запустите его снова, чтобы войти заново.</p>")
+                    runtime.shutdown()
+                    return
                 elif self.path == "/single-export":
                     chat_id = form["chat_id"][0]
                     start = parse_form_datetime(form, "start")
@@ -893,8 +1008,6 @@ def make_handler(runtime: Runtime, token: str):
                         runtime.service.save()
                     runtime.call(save_retention)
                 elif self.path == "/autostart":
-                    if form.get("enabled") == ["yes"] and getattr(runtime, "external_session", False):
-                        raise ValueError("Автозапуск для старой сессии пока недоступен: запускайте её через start-existing-session-linux.sh.")
                     autostart.configure(form.get("enabled") == ["yes"], runtime.service.home, runtime.service.exports)
                 else:
                     self.send("Not found", 404); return
@@ -952,10 +1065,23 @@ def run(home: Path, exports: Path, port: int = 8765, *, open_browser: bool = Tru
     if browser_auth and not offline_legacy:
         from .browser_login import BrowserLogin
         login = BrowserLogin()
-    try:
+
+    def invoke():
         return _run(home, exports, port, open_browser=open_browser, wait_for_cooldown=wait_for_cooldown,
                     session_file=session_file, require_existing_auth=require_existing_auth,
                     offline_legacy=offline_legacy, login=login)
+
+    try:
+        try:
+            return invoke()
+        except Exception as exc:
+            if login is None:
+                raise
+            login.fail(f"Signal Archive не смог запуститься.\n\n{exc}")
+            if not login.reset_requested:
+                return
+            session_ops.request_session_switch(home)
+            return invoke()
     finally:
         if login:
             login.close()
@@ -972,9 +1098,12 @@ def _run(home: Path, exports: Path, port: int = 8765, *, open_browser: bool = Tr
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     with SessionLock(home / "session.lock"):
         service = DirectService(None, home, exports)
+        finish_session_switch(home, service)
         if offline_legacy and (session_file is not None or require_existing_auth or wait_for_cooldown):
             raise ValueError("Офлайн-режим нельзя совмещать с параметрами сессии.")
         if not offline_legacy:
+            session_file, require_existing_auth = session_ops.resolve_startup_session(
+                service.state, session_file, require_existing_auth)
             if session_file is not None:
                 session_file = session_file.expanduser().absolute()
                 if session_file.is_symlink() or not session_file.is_file() or session_file.suffix != ".session":
@@ -1006,11 +1135,9 @@ def _run(home: Path, exports: Path, port: int = 8765, *, open_browser: bool = Tr
                             raise RuntimeError(message) from None
                         wait_for_saved_cooldown(service)
                     except (errors.AuthKeyUnregisteredError, errors.SessionRevokedError, errors.SessionExpiredError, errors.AuthKeyDuplicatedError):
-                        if session_file is not None:
-                            raise RuntimeError("Telegram отклонил старую сессию. Её файл не удалён и новый код автоматически не запрашивался.") from None
-                        raise RuntimeError("Telegram rejected the saved session. Close the app and use the documented forget-telegram-login command, then sign in again. Existing exports and selection state will be kept.") from None
+                        raise RuntimeError("Telegram отклонил сохранённую сессию. Откройте Settings → «Сменить сессию» (или используйте forget-telegram-login) и войдите заново; экспорт и настройки будут сохранены.") from None
                     except (errors.PhoneNumberInvalidError, errors.ApiIdInvalidError):
-                        raise RuntimeError("Telegram rejected the phone number or API credentials. Check them and use the documented forget-telegram-login command to enter them again.") from None
+                        raise RuntimeError("Telegram rejected the phone number or API credentials. Проверьте данные и выберите «Сменить сессию» в Settings.") from None
                     except errors.PhoneNumberBannedError:
                         raise RuntimeError("Telegram reports that this phone number is banned. Resolve this with Telegram before trying again.") from None
                     except errors.RPCError as exc:
@@ -1056,3 +1183,4 @@ def _run(home: Path, exports: Path, port: int = 8765, *, open_browser: bool = Tr
             if client is not None:
                 loop.run_until_complete(_disconnect_client(client))
             loop.close()
+            finish_session_switch(home, service)
