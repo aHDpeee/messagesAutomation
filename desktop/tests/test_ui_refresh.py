@@ -43,6 +43,19 @@ class RefreshUiTests(unittest.TestCase):
                                 capture_output=True, text=True, check=True, timeout=5)
         return json.loads(result.stdout)
 
+    def test_recent_exports_refresh_as_text_and_preserve_unchanged_list(self):
+        harness = r'''
+const vm=require('vm'),fs=require('fs');
+const list={children:[],writes:0,replaceChildren(){this.children=[];this.writes++},appendChild(x){this.children.push(x)}};
+const ctx={document:{getElementById(id){return {refreshForm:{dataset:{started:''},querySelector(){return {value:'token'}}},'recent-exports':list,status:{}}[id]},createElement(){return {textContent:''}},querySelectorAll(){return []}},sessionStorage:{getItem(){return null}},fetch(){return Promise.resolve({json(){return Promise.resolve({})}})},location:{reload(){}},setInterval(){},console};
+vm.runInNewContext(fs.readFileSync(0,'utf8'),ctx);
+ctx.updateRecentExports(['<img src=x onerror=alert(1)>']);
+ctx.updateRecentExports(['<img src=x onerror=alert(1)>']);
+process.stdout.write(JSON.stringify({text:list.children[0].textContent,writes:list.writes}));
+'''
+        result = subprocess.run(["node", "-e", harness], input=UI_SCRIPT, capture_output=True, text=True, check=True, timeout=5)
+        self.assertEqual(json.loads(result.stdout), {"text": "<img src=x onerror=alert(1)>", "writes": 1})
+
     def test_new_completed_refresh_reloads_without_unsaved_selection(self):
         result = self.run_ui(pending={"token": "token", "started": "old"},
                              job={"name": "refresh dialogs", "status": "success", "started_at": "new"})
@@ -102,3 +115,21 @@ process.stdout.write(JSON.stringify({team,ungrouped,checked:checked.checked}));
 '''
         result = subprocess.run(["node", "-e", harness], input=UI_SCRIPT, capture_output=True, text=True, check=True, timeout=5)
         self.assertEqual(json.loads(result.stdout), {"team": [False, False], "ungrouped": [False, False], "checked": True})
+
+    def test_search_tokens_filter_types_and_activity(self):
+        harness = r'''
+const vm = require('vm'), fs = require('fs');
+const search = {value:''};
+const chats = [
+ {hidden:false,dataset:{search:'friends group',type:'group',active:'yes'},querySelector(){return null;}},
+ {hidden:false,dataset:{search:'news channel',type:'channel',active:'no'},querySelector(){return null;}},
+ {hidden:false,dataset:{search:'alice chat',type:'chat',active:'yes'},querySelector(){return null;}}
+];
+const ctx = {document:{getElementById(id){return {refreshForm:{dataset:{started:''},querySelector(){return {value:'token'}}},search,status:{},selectionNotice:{}}[id]},querySelectorAll(s){return s==='.chat'?chats:[]}},sessionStorage:{getItem(){return null}},fetch(){return Promise.resolve({json(){return Promise.resolve({})}})},location:{reload(){}},setInterval(){},console};
+vm.runInNewContext(fs.readFileSync(0,'utf8'),ctx);
+search.value='@group @active';ctx.filter();const first=chats.map(c=>c.hidden);
+search.value='@channel';ctx.filter();const second=chats.map(c=>c.hidden);
+search.value='@chat alice';ctx.filter();process.stdout.write(JSON.stringify({first,second,third:chats.map(c=>c.hidden)}));
+'''
+        result = subprocess.run(["node", "-e", harness], input=UI_SCRIPT, capture_output=True, text=True, check=True, timeout=5)
+        self.assertEqual(json.loads(result.stdout), {"first": [False, True, True], "second": [True, False, True], "third": [True, True, False]})

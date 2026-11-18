@@ -73,6 +73,26 @@ class ProblemChatsTests(unittest.TestCase):
         self.assertEqual([item["reason"] for item in result["urgent"]], ["bot_awaiting_reply"])
         self.assertEqual([item["title"] for item in result["stale"]], ["Old personal"])
 
+    def test_links_are_normalized_and_untrusted_urls_are_rejected(self):
+        state = {"dialogs": [
+            {"id": "1", "title": "Quiet public", "type": "channel", "username": "news_test", "last_message_date": "2026-01-01T00:00:00+00:00"},
+            {"id": "2", "title": "Quiet unsafe", "type": "group", "link": "https://evil.example/path", "last_message_date": "2026-01-01T00:00:00+00:00"},
+        ], "problem_chats": {}}
+        problem_chats.record_problem(state, "-300", title="Pending", kind="group", reason="requested", message="Waiting", reference="https://t.me/+JoinCode")
+        result = problem_chats.classify_problems(state, now=NOW)
+        links = {item["title"]: item["link"] for item in result["all"]}
+        self.assertEqual(links["Quiet public"], "https://t.me/news_test")
+        self.assertEqual(links["Quiet unsafe"], "")
+        self.assertEqual(links["Pending"], "https://t.me/+JoinCode")
+        self.assertTrue(next(item for item in result["all"] if item["title"] == "Pending")["pending_request"])
+
+    def test_numeric_request_does_not_trigger_red_highlight(self):
+        state = {"dialogs": [{"id": "-100", "title": "Group", "type": "group", "username": "group_test"}]}
+        problem_chats.record_problem(state, "-100", title="Group", kind="group", reason="requested", message="Waiting", reference="-100")
+        item = problem_chats.classify_problems(state, now=NOW)["all"][0]
+        self.assertEqual(item["link"], "https://t.me/group_test")
+        self.assertFalse(item["pending_request"])
+
 
 if __name__ == "__main__":
     unittest.main()

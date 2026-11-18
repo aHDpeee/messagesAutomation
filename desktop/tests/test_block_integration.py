@@ -18,7 +18,7 @@ class BlockIntegrationTests(unittest.TestCase):
             catalog.assign_block(service.state, block, ['1'])
             second = catalog.create_block(service.state, 'Work')
             catalog.assign_block(service.state, second, ['1'])
-            service.select(catalog.expand_selection(service.state, ['2'], [block]))
+            service.select(catalog.expand_selection(service.state, ['2'], [second]))
             async def export(client, chat_id, out_dir, **kwargs):
                 path = out_dir / f'{chat_id}.csv'
                 path.write_text('id\n1\n')
@@ -30,7 +30,7 @@ class BlockIntegrationTests(unittest.TestCase):
             with zipfile.ZipFile(results[0]['path']) as archive:
                 names = archive.namelist()
                 self.assertIn('chats.txt', names)
-                self.assertTrue(any(name.startswith('Friends_') and name.endswith('/1.csv') for name in names))
+                self.assertFalse(any(name.startswith('Friends_') and name.endswith('/1.csv') for name in names))
                 self.assertTrue(any(name.startswith('Work_') and name.endswith('/1.csv') for name in names))
                 self.assertIn('2.csv', names)
                 self.assertIn('One', archive.read('chats.txt').decode('utf-8-sig'))

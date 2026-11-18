@@ -102,6 +102,8 @@ def _normalize_date(value: str) -> str:
 
 def create_block(state: dict, name: str) -> str:
     name = _name(name)
+    if name.casefold() == "ungrouped":
+        raise ValueError("Ungrouped is reserved for chats exported to the ZIP root.")
     blocks = state.setdefault("blocks", {})
     if any(block["name"].casefold() == name.casefold() for block in blocks.values()):
         raise ValueError("A block with this name already exists.")
@@ -115,6 +117,8 @@ def rename_block(state: dict, block_id: str, name: str) -> None:
     if block_id not in blocks:
         raise ValueError("Block not found.")
     name = _name(name)
+    if name.casefold() == "ungrouped":
+        raise ValueError("Ungrouped is reserved for chats exported to the ZIP root.")
     if any(key != block_id and block["name"].casefold() == name.casefold() for key, block in blocks.items()):
         raise ValueError("A block with this name already exists.")
     blocks[block_id]["name"] = name
@@ -124,7 +128,38 @@ def delete_block(state: dict, block_id: str) -> None:
     blocks = state.setdefault("blocks", {})
     if block_id not in blocks:
         raise ValueError("Block not found.")
+    removed = {str(i) for i in blocks[block_id].get("chat_ids", [])}
     del blocks[block_id]
+    state["selected"] = [i for i in state.get("selected", []) if str(i) not in removed]
+
+
+def chat_group(state: dict, chat_id: str) -> str | None:
+    ident = str(chat_id)
+    for block_id, block in state.get("blocks", {}).items():
+        if ident in map(str, block.get("chat_ids", [])):
+            return str(block_id)
+    return "ungrouped" if ident in map(str, state.get("root_selected", [])) else None
+
+
+def set_chat_group(state: dict, chat_id: str, group_id: str | None) -> None:
+    """Assign exactly one export destination; None excludes the chat."""
+    ident = str(int(chat_id))
+    known = {str(d["id"]) for d in state.get("dialogs", [])} | set(map(str, state.get("selected", [])))
+    if ident not in known:
+        raise ValueError("Chat is not in the catalog.")
+    blocks = state.setdefault("blocks", {})
+    if group_id not in (None, "ungrouped") and group_id not in blocks:
+        raise ValueError("Group not found.")
+    for block in blocks.values():
+        block["chat_ids"] = [str(i) for i in block.get("chat_ids", []) if str(i) != ident]
+    state["root_selected"] = [str(i) for i in state.get("root_selected", []) if str(i) != ident]
+    state["selected"] = [str(i) for i in state.get("selected", []) if str(i) != ident]
+    if group_id == "ungrouped":
+        state["root_selected"].append(ident)
+    elif group_id is not None:
+        blocks[group_id].setdefault("chat_ids", []).append(ident)
+    if group_id is not None:
+        state["selected"].append(ident)
 
 
 def assign_block(state: dict, block_id: str, chat_ids: list[str]) -> None:
@@ -135,7 +170,12 @@ def assign_block(state: dict, block_id: str, chat_ids: list[str]) -> None:
     ids = list(dict.fromkeys(str(int(chat_id)) for chat_id in chat_ids))
     if any(chat_id not in known for chat_id in ids):
         raise ValueError("One or more chats are not in the catalog.")
-    blocks[block_id]["chat_ids"] = ids
+    previous = list(blocks[block_id].get("chat_ids", []))
+    for ident in previous:
+        if str(ident) not in ids:
+            set_chat_group(state, str(ident), None)
+    for ident in ids:
+        set_chat_group(state, ident, block_id)
 
 
 def expand_selection(state: dict, chat_ids: list[str], block_ids: list[str]) -> list[str]:
@@ -226,6 +266,10 @@ def write_catalog(state: dict, path: Path, *, expected_hash: str | None = None, 
         for dialog in state.get("dialogs", []):
             ident = str(dialog["id"])
             names = [block["name"] for block in blocks.values() if ident in block.get("chat_ids", [])]
+            if state.get("group_semantics_version") == 1:
+                names = names[:1] if ident in selected else []
+                if ident in selected and not names:
+                    names = ["Ungrouped"]
             row = {key: _text(dialog.get(key)) for key in CATALOG_FIELDS}
             block_text = json.dumps(names, ensure_ascii=False) if names and (names[0].startswith("[") or any("," in name for name in names)) else ", ".join(names)
             row.update(id=ident, selected="yes" if ident in selected else "no", link=_text(_link(dialog)), blocks=_text(block_text))
@@ -285,7 +329,8 @@ def parse_catalog(content: bytes | str, state: dict) -> dict:
     previous_blocks = {str(b["name"]).casefold(): ident for ident, b in result.get("blocks", {}).items()}
     blocks: dict[str, dict] = {}
     names: dict[str, str] = {}
-    dialogs, selected, seen = [], [], set()
+    dialogs, selected, seen, root_selected = [], [], set(), []
+    legacy = state.get("group_semantics_version") != 1
 
     def unescape(value: str) -> str:
         if value.startswith("'") and (value[1:].lstrip(" \t\r\n").startswith(("=", "+", "-", "@")) or value[1:].startswith(("\t", "\r", "\n"))):
@@ -322,7 +367,7 @@ def parse_catalog(content: bytes | str, state: dict) -> dict:
         dialog["id"] = ident
         dialog.setdefault("accessible", True)
         dialogs.append(dialog)
-        if choice in {"yes", "true", "1"}:
+        if legacy and choice in {"yes", "true", "1"}:
             selected.append(ident)
         if row["blocks"].startswith("["):
             try:
@@ -333,8 +378,16 @@ def parse_catalog(content: bytes | str, state: dict) -> dict:
                 raise ValueError("Invalid block list in catalog.")
         else:
             block_values = row["blocks"].split(",")
-        for block_name in (x.strip() for x in block_values):
+        block_values = list(dict.fromkeys(x.strip() for x in block_values if x.strip()))
+        if not legacy and len(block_values) > 1:
+            raise ValueError("Each chat may have only one group.")
+        if not legacy and block_values:
+            selected.append(ident)
+        for block_name in block_values:
             if not block_name:
+                continue
+            if not legacy and block_name.casefold() == "ungrouped":
+                root_selected.append(ident)
                 continue
             block_name = _name(block_name)
             key = block_name.casefold()
@@ -346,6 +399,8 @@ def parse_catalog(content: bytes | str, state: dict) -> dict:
             if ident not in block["chat_ids"]:
                 block["chat_ids"].append(ident)
     result["dialogs"], result["selected"], result["blocks"] = dialogs, selected, blocks
+    if not legacy:
+        result["root_selected"] = root_selected
     return result
 
 

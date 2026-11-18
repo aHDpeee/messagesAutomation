@@ -110,12 +110,42 @@ class DirectService:
                 self.sync_catalog()
             except (ValueError, OSError, RuntimeError) as exc:
                 self.catalog_sync_error = str(exc)
+        if self.catalog_ready:
+            self._migrate_group_semantics()
         if self.state.get("job", {}).get("status") == "running":
             self.state["job"].update(status="interrupted", error="The application stopped before this job completed.")
             self.save()
 
     def save(self) -> None:
         _write_state(self.state_path, self.state)
+
+    def _migrate_group_semantics(self) -> None:
+        """Preserve prior selection while converting to one destination per chat."""
+        if self.state.get("group_semantics_version") == 1:
+            return
+        expected = catalog._file_hash(self.catalog_path)
+        if not self.catalog_is_current():
+            return
+        if self.state.get("dialogs") or self.state.get("selected") or self.state.get("blocks"):
+            catalog.backup_catalog(self.state, self.catalog_path)
+        updated = copy.deepcopy(self.state)
+        selected = list(dict.fromkeys(map(str, updated.get("selected", []))))
+        blocks = updated.setdefault("blocks", {})
+        memberships = {ident: [] for ident in selected}
+        for key, block in blocks.items():
+            for ident in map(str, block.get("chat_ids", [])):
+                if ident in memberships:
+                    memberships[ident].append(key)
+            block["chat_ids"] = []
+        updated["selected"], updated["root_selected"] = list(selected), []
+        reserved = {key for key, block in blocks.items() if str(block.get("name", "")).casefold() == "ungrouped"}
+        for ident in selected:
+            group = next((key for key in memberships[ident] if key not in reserved), "ungrouped")
+            catalog.set_chat_group(updated, ident, group)
+        for key in reserved:
+            del blocks[key]
+        updated["group_semantics_version"] = 1
+        self._commit_catalog_state(updated, expected)
 
     def _recover_catalog_import(self) -> None:
         """Finish a validated import after a crash without discarding later edits."""
@@ -177,6 +207,7 @@ class DirectService:
         self.catalog_journal.unlink(missing_ok=True)
         self.catalog_ready = True
         self.catalog_sync_error = ""
+        self._migrate_group_semantics()
         return True
 
     def _commit_catalog_state(self, updated: dict, old_hash: str | None) -> None:
@@ -284,7 +315,7 @@ class DirectService:
             _write_state(snapshot, self.state)
             catalog.backup_catalog(self.state, self.catalog_path)
             def reset_for_new_account(state):
-                state.update(account_id=account_id, dialogs=[], selected=[], blocks={}, checkpoints={}, last_selection_exports={}, problem_chats={})
+                state.update(account_id=account_id, dialogs=[], selected=[], root_selected=[], blocks={}, checkpoints={}, last_selection_exports={}, problem_chats={})
                 state.pop("account_switch_pending", None)
             self.mutate_catalog(reset_for_new_account)
             return
@@ -308,7 +339,14 @@ class DirectService:
         selected = list(dict.fromkeys(str(int(item)) for item in ids))
         if any(item not in available for item in selected):
             raise ValueError("A selected chat is not in the current dialog list. Refresh it first.")
-        self.mutate_catalog(lambda state: state.update(selected=selected))
+        def update(state):
+            for ident in list(state.get("selected", [])):
+                if str(ident) not in selected:
+                    catalog.set_chat_group(state, str(ident), None)
+            for ident in selected:
+                if catalog.chat_group(state, ident) is None:
+                    catalog.set_chat_group(state, ident, "ungrouped")
+        self.mutate_catalog(update)
 
     def cooldown_remaining(self) -> float:
         until = self.state.get("cooldown_until")
@@ -373,6 +411,34 @@ class DirectService:
                     pass
             return result
 
+    async def fetch_telegram_folders(self) -> dict[str, Any]:
+        from . import telegram_folders
+        async def fetch():
+            folders = await telegram_folders.discover(self.client)
+            self.state["telegram_folders"] = folders
+            self.save()
+            return {"count": len(folders)}
+        return await self._run("fetch Telegram folders", fetch)
+
+    def preview_telegram_folder(self, folder_id: str) -> dict[str, Any]:
+        from . import telegram_folders
+        self.sync_catalog()
+        folder = next((item for item in self.state.get("telegram_folders", []) if item["id"] == str(folder_id)), None)
+        if folder is None:
+            raise ValueError("Refresh Telegram folders and choose one.")
+        return telegram_folders.preview(self.state, folder)
+
+    def import_telegram_folder(self, folder_id: str, strategy: str, expected: str) -> dict[str, Any]:
+        from . import telegram_folders
+        folder = next((item for item in self.state.get("telegram_folders", []) if item["id"] == str(folder_id)), None)
+        if folder is None:
+            raise ValueError("Refresh Telegram folders and choose one.")
+        result: dict[str, Any] = {}
+        def update(state):
+            result.update(telegram_folders.apply(state, folder, strategy, expected))
+        self.mutate_catalog(update)
+        return result
+
     async def refresh_dialogs(self) -> list[dict[str, Any]]:
         from .telegram_ops import _dialog_record, pace_iterator
 
@@ -399,11 +465,11 @@ class DirectService:
                 if numeric:
                     dialogs = [d for d in state["dialogs"] if str(d["id"]) != ident] + [record]
                     state["dialogs"] = catalog.merge_dialogs(state, dialogs, method=method)
-                    if ident not in state["selected"]:
-                        state["selected"].append(ident)
+                    if catalog.chat_group(state, ident) is None:
+                        catalog.set_chat_group(state, ident, "ungrouped")
                 if join["problem"]:
                     problem_chats.record_problem(state, ident, title=title, kind=kind,
-                                                 reason=join["status"], message=join["message"])
+                                                 reason=join["status"], message=join["message"], reference=reference)
                 else:
                     # A link can be added before the join is approved and later
                     # resolve to a numeric chat id; clear both possible keys.
@@ -433,6 +499,8 @@ class DirectService:
         async def export():
             self.sync_catalog(internal=True)
             selected = list(self.state["selected"]) if chat_ids is None else catalog.expand_selection(self.state, chat_ids, [])
+            if any(str(ident) not in set(map(str, self.state["selected"])) for ident in selected):
+                raise ValueError("Assign a group before exporting this chat.")
             if expected_selection is not None and selection_fingerprint(selected) != expected_selection:
                 raise ValueError("The saved selection changed. Refresh the page before exporting.")
             if not selected:
@@ -456,6 +524,7 @@ class DirectService:
             names = [b["name"] for b in self.state.get("blocks", {}).values() if set(b.get("chat_ids", [])) & set(selected)]
             label = " + ".join(names) if names else (next((d.get("title", "") for d in self.state["dialogs"] if str(d["id"]) == selected[0]), "") if len(selected) == 1 else "selection")
             bundle = _new_bundle(self.exports, "chats", label=label or "selection", since=since, until=until)
+            previous_chat_messages = None
             with tempfile.TemporaryDirectory(prefix="signal-archive-") as staging:
                 for index, chat_id in enumerate(selected):
                     self.state["job"]["current_chat"] = chat_id
@@ -464,9 +533,10 @@ class DirectService:
                     self.state["job"]["current_messages"] = 0
                     self.save()
                     if index:
-                        # A new iterator starts a new request immediately; pause
-                        # between chats as well as between pages within a chat.
-                        await asyncio.sleep(3)
+                        # Even an empty chat needs a Telegram request. Keep a
+                        # pause, but avoid spending three seconds on each empty
+                        # result. Pagination remains paced separately.
+                        await asyncio.sleep(3 if previous_chat_messages is None else 1 if previous_chat_messages == 0 else 2)
                     checkpoint = 0 if independent else int(self.state["checkpoints"].get(chat_id, 0))
                     chat_info = next((d for d in self.state["dialogs"] if d["id"] == chat_id), None)
                     chat_messages = 0
@@ -510,10 +580,12 @@ class DirectService:
                                 break
                             await asyncio.sleep(3)
                     except inaccessible as exc:
+                        previous_chat_messages = None
                         failures.append({"chat_id": chat_id, "title": (chat_info or {}).get("title", ""), "error": str(exc) or type(exc).__name__})
                         self.state["job"]["failures"] = list(failures)
                         self.save()
                         continue
+                    previous_chat_messages = chat_messages
                     completed_chats += 1
                     self.state["job"]["completed"] = completed_chats
                     self.save()

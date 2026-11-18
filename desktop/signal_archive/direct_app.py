@@ -23,6 +23,75 @@ from . import autostart, legacy_archive, catalog, problem_chats, session as sess
 
 SERVICE = "SignalArchiveDirect"
 
+
+def _recent_export_lines(state: dict) -> list[str]:
+    """Describe completed exports as text; escape only at the output boundary."""
+    lines = []
+    for key, kind in (("last_export_messages", "New messages"), ("last_export_recent", "Recent period"), ("last_export_snapshot", "Snapshot")):
+        for result in state.get(key, {}).get("result", []):
+            label = str(result.get("chat_title") or result.get("chat_id") or "Chat")
+            path = result.get("path")
+            detail = f"{path} — {int(result.get('messages', 0))} messages" if path else "No messages in this export"
+            lines.append(f"{kind}, {label}: {detail}")
+    member = state.get("last_export_group_members", {}).get("result", {})
+    if isinstance(member, dict) and member.get("path"):
+        lines.append(f"Group members: {member['path']} — {int(member.get('members_exported', 0))} members")
+    return lines
+
+
+def _help_page(title: str, content: str) -> str:
+    """Render the bundled help without exposing a local file path."""
+    return ("<!doctype html><html lang=ru><head><meta charset=utf-8>"
+            '<meta name=viewport content="width=device-width,initial-scale=1">'
+            f"<title>{html.escape(title)} — Signal Archive</title><style>"
+            "body{font:16px/1.6 system-ui,sans-serif;background:#0c1520;color:#edf5f8;max-width:850px;margin:auto;padding:24px}"
+            "main{background:#172331;border:1px solid #304357;border-radius:16px;padding:24px}"
+            "a{color:#83e4d2}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}"
+            "blockquote{margin:1em 0;padding:12px 18px;border-left:4px solid #65d6c0;background:#0e1b27;border-radius:8px;overflow-wrap:anywhere}"
+            "nav{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:20px}li{margin:.6em 0}</style></head><body>"
+            '<nav><a href="/">← К приложению</a><a href="/training">Обучение</a>'
+            '<a href="/codex-guide">Гайд Codex</a></nav>'
+            f"<main><h1>{html.escape(title)}</h1>{content}</main>"
+            '<p>Автор: <a href="https://t.me/ahdpeee" target="_blank" rel="noopener noreferrer">@ahdpeee</a> · '
+            '<a href="https://github.com/aHDpeee/messagesAutomation" target="_blank" rel="noopener noreferrer">GitHub и вклад в проект</a></p></body></html>')
+
+
+def _guide_html(markdown: str) -> str:
+    """Render the bundled small Markdown guide without allowing arbitrary HTML."""
+    def inline(text: str) -> str:
+        chunks, pos = [], 0
+        for match in re.finditer(r"\[([^\]\n]+)\]\((https://[^\s)]+)\)", text):
+            chunks.append(html.escape(text[pos:match.start()]))
+            label, url = match.groups()
+            chunks.append(f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">{html.escape(label)}</a>')
+            pos = match.end()
+        chunks.append(html.escape(text[pos:]))
+        return "".join(chunks)
+    blocks = []
+    for paragraph in re.split(r"\n\s*\n", markdown.strip()):
+        lines = paragraph.splitlines()
+        if all(line.startswith(">") for line in lines):
+            blocks.append("<blockquote>" + inline(" ".join(line[1:].strip() for line in lines)) + "</blockquote>")
+        elif len(lines) == 1 and lines[0].startswith("# "):
+            continue  # Page already renders the title.
+        elif len(lines) == 1 and lines[0].startswith("## "):
+            blocks.append("<h2>" + inline(lines[0][3:]) + "</h2>")
+        else:
+            blocks.append("<p>" + inline(" ".join(lines)) + "</p>")
+    return "".join(blocks)
+
+
+def _training_page() -> str:
+    return _help_page("Как пользоваться", """
+<ol>
+<li>Войдите в Telegram. При первом входе нужны API ID и API hash из <a href="https://my.telegram.org" target="_blank" rel="noopener noreferrer">my.telegram.org</a>.</li>
+<li>Обновите список и добавьте нужные чаты по ссылке или имени. Поиск поддерживает подсказки типов чатов.</li>
+<li>Создайте блок кнопкой «+» рядом с вкладками. Назначьте каждому экспортируемому чату один блок; Ungrouped сохраняется в корень ZIP.</li>
+<li>Укажите период и запустите экспорт. Окно состояния показывает ход и результат; готовый ZIP лежит в указанной папке.</li>
+<li>Участников групп экспортируйте только по запросу через интерфейс. Telegram может скрывать часть списка.</li>
+<li>В настройках можно работать с CSV-каталогом и резервными копиями. Для анализа результатов откройте <a href="/codex-guide">гайд Codex</a>.</li>
+</ol>""")
+
 UI_SCRIPT = r"""
 let selectionDirty = false;
 let refreshReady = false;
@@ -79,10 +148,23 @@ function rememberRefresh(kind = 'refresh dialogs') {
     return true;
 }
 function filter() {
-    let q = document.getElementById('search').value.toLowerCase();
+    const terms = document.getElementById('search').value.toLowerCase().trim().split(/\s+/).filter(Boolean);
     document.querySelectorAll('.chat').forEach(x => {
-        x.hidden = !x.dataset.search.includes(q);
+        x.hidden = !terms.every(term => {
+            if (term === '@group') return x.dataset.type === 'group';
+            if (term === '@channel') return x.dataset.type === 'channel';
+            if (term === '@chat') return x.dataset.type === 'chat';
+            if (term === '@active') return x.dataset.active === 'yes';
+            return (x.dataset.search || '').includes(term);
+        });
     });
+}
+function useSearchToken(token) {
+    const search = document.getElementById('search');
+    search.value = token + ' ';
+    search.focus();
+    document.getElementById('search-suggestions').hidden = true;
+    filter();
 }
 let activeGroup = 'ungrouped';
 let groupSavePending = false;
@@ -90,8 +172,8 @@ function syncGroupCheckboxes() {
     document.querySelectorAll('.chat').forEach(row => {
         const box = row.querySelector('.group-membership');
         if (!box) return;
-        const groups = (row.dataset.groups || '').split(' ').filter(Boolean);
-        box.checked = activeGroup === 'ungrouped' ? groups.length === 0 : groups.includes(activeGroup);
+        box.checked = (row.dataset.group || '') === activeGroup;
+        if (row.style) row.style.order = box.checked ? '-2' : '';
     });
 }
 function showGroup(id, button) {
@@ -100,14 +182,10 @@ function showGroup(id, button) {
     syncGroupCheckboxes();
     filter();
 }
+syncGroupCheckboxes();
 async function saveGroupMembership(box) {
     if (groupSavePending) { syncGroupCheckboxes(); return; }
     const row = box.closest('.chat'), group = activeGroup, value = box.checked;
-    if (group === 'ungrouped' && !value) {
-        box.checked = true;
-        document.getElementById('group-notice').textContent = 'Choose a named group to move this chat out of Ungrouped.';
-        return;
-    }
     groupSavePending = true;
     const checkboxes = document.querySelectorAll('.group-membership');
     checkboxes.forEach(x => x.disabled = true);
@@ -116,8 +194,13 @@ async function saveGroupMembership(box) {
         const response = await fetch('/group-membership', {method: 'POST', body: fields});
         const result = await response.json();
         if (!response.ok) throw Error(result.error || 'Could not save group.');
-        row.dataset.groups = result.groups.join(' ');
+        row.dataset.group = result.group || '';
+        const selected = row.querySelector('input[name="chat"]');
+        if (selected) selected.checked = !!result.group;
         document.getElementById('group-catalog-hash').value = result.hash;
+        document.querySelectorAll('input[name="selection"]').forEach(input => input.value = result.selection_hash);
+        const total = document.getElementById('selected-count');
+        if (total) total.textContent = result.selected_count;
         document.getElementById('group-notice').textContent = 'Group saved.';
     } catch (error) { document.getElementById('group-notice').textContent = error.message || 'Could not save group.'; }
     finally { groupSavePending = false; checkboxes.forEach(x => x.disabled = false); syncGroupCheckboxes(); }
@@ -168,8 +251,41 @@ function selectVisible(value) {
         }
     });
 }
+let scheduleTiming = {};
+let recentExportsSignature = null;
+function updateRecentExports(lines) {
+    const list = document.getElementById('recent-exports');
+    if (!list || !Array.isArray(lines)) return;
+    const signature = JSON.stringify(lines);
+    if (signature === recentExportsSignature) return;
+    recentExportsSignature = signature;
+    list.replaceChildren();
+    for (const text of lines.length ? lines : ['Пока нет завершённых экспортов.']) {
+        const item = document.createElement('li');
+        item.textContent = text;
+        list.appendChild(item);
+    }
+}
+function updateScheduleSummary() {
+    const element = document.getElementById('schedule-summary');
+    if (!element) return;
+    const parts = [], now = Date.now();
+    if (scheduleTiming.next_at) {
+        const seconds = Math.max(0, Math.ceil((Date.parse(scheduleTiming.next_at) - now) / 1000));
+        if (Number.isFinite(seconds)) parts.push('next export in ' + (seconds >= 3600 ? Math.ceil(seconds / 3600) + 'h' : seconds >= 60 ? Math.ceil(seconds / 60) + 'm' : seconds + 's'));
+    }
+    if (scheduleTiming.last_at) {
+        const days = Math.floor((now - Date.parse(scheduleTiming.last_at)) / 86400000);
+        if (days >= 1) parts.push('last export ' + days + 'd ago');
+    }
+    element.textContent = parts.join(' · ');
+    element.hidden = !parts.length;
+}
 function update() {
     fetch('/status').then(r => r.json()).then(s => {
+        scheduleTiming = s.schedule_timing || {};
+        updateScheduleSummary();
+        updateRecentExports(s.recent_exports);
         let j = s.job || {}, t = j.name ? j.name + ': ' + j.status : 'No activity yet.';
         latestStarted = j.started_at || '';
         let pending = null;
@@ -193,6 +309,10 @@ function update() {
         if (refreshReady) t += '\nThe new chat list is ready. Save your selection to show it.';
         else if (j.status === 'success' && j.name === 'refresh dialogs') t += '\nRefresh the page to see the new list.';
         document.getElementById('status').textContent = t;
+        const summary = document.getElementById('status-short');
+        if (summary) summary.textContent = j.name ? (j.status === 'running' ? 'Выполняется…' : j.status) : 'Нет операций';
+        const activity = document.getElementById('activity');
+        if (activity) activity.classList.toggle('running', j.status === 'running');
         let alerted = '';
         try { alerted = sessionStorage.getItem('signal-add-alert') || ''; } catch (_) {}
         if (j.name === 'add chat' && j.started_at && j.started_at !== alerted && j.status !== 'running') {
@@ -206,6 +326,8 @@ function update() {
 }
 update();
 setInterval(update, 3000);
+setInterval(updateScheduleSummary, 1000);
+if (location.hash === '#settings') showPage('settings');
 """
 
 
@@ -511,6 +633,9 @@ def make_handler(runtime: Runtime, token: str):
                     self.send('Not found', 404); return
                 self.send(prove(secret, self.path.rsplit('/', 1)[1]), content_type='text/plain; charset=utf-8')
                 return
+            if self.path == "/training":
+                self.send(_training_page())
+                return
             if self.path == "/codex-guide":
                 import sys
                 root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -518,10 +643,11 @@ def make_handler(runtime: Runtime, token: str):
                     guide = (root / "CODEX_ARCHIVE_GUIDE.md").read_text(encoding="utf-8")
                 except OSError:
                     self.send("Guide unavailable", 404); return
-                self.send("<!doctype html><meta charset=utf-8><title>Codex guide</title><pre style='white-space:pre-wrap'>" + html.escape(guide) + "</pre>")
+                self.send(_help_page("Анализ архивов с Codex", _guide_html(guide)))
                 return
             if self.path == "/status":
-                state = runtime.call(lambda: {"job": json.loads(json.dumps(runtime.service.state.get("job", {})))})
+                from .schedule_timing import summary as schedule_summary
+                state = runtime.call(lambda: {"job": json.loads(json.dumps(runtime.service.state.get("job", {}))), "schedule_timing": schedule_summary(runtime.service.state), "recent_exports": _recent_export_lines(runtime.service.state)})
                 self.send(json.dumps(state, ensure_ascii=False), content_type="application/json; charset=utf-8"); return
             if self.path != "/":
                 self.send("Not found", 404); return
@@ -566,15 +692,17 @@ def make_handler(runtime: Runtime, token: str):
                 else:
                     chat_title = f"{title} <small title='Telegram provides no public chat link'>No public link</small>"
                 availability = " · inaccessible" if not accessible else ""
-                groups = ' '.join(str(key) for key, block in state.get('blocks', {}).items() if str(d['id']) in block.get('chat_ids', []))
-                groups = html.escape(groups, quote=True)
+                group = html.escape(str(catalog.chat_group(state, str(d['id'])) or ''), quote=True)
+                last = problem_chats._last_date(d)
+                active = 'yes' if last and last >= datetime.now().astimezone() - timedelta(days=problem_chats.problem_days(state)) else 'no'
                 export_checked = " checked" if ident in chosen else ""
-                group_checked = " checked" if not groups else ""
-                rows.append(f"<div class=chat data-id='{ident}' data-groups='{groups}' data-type='{kind}' data-search='{title.lower()} {kind}'><input type=checkbox name=chat value='{ident}'{export_checked} hidden><span class=chat-title>{chat_title} <small>{kind}{availability}</small></span><label><input type=checkbox class=group-membership{group_checked} onchange='saveGroupMembership(this)'> In this group</label>{single}{member}</div>")
+                group_checked = " checked" if group == 'ungrouped' else ""
+                rows.append(f"<div class=chat data-id='{ident}' data-group='{group}' data-active='{active}' data-type='{kind}' data-search='{title.lower()} {html.escape(str(username).lower(), quote=True)} {kind}'><input type=checkbox name=chat value='{ident}'{export_checked} hidden><span class=chat-title>{chat_title} <small>{kind}{availability}</small></span><label><input type=checkbox class=group-membership{group_checked} onchange='saveGroupMembership(this)'> In this group</label>{single}{member}</div>")
             visible_ids = {d["id"] for d in state["dialogs"]}
             for missing in sorted(chosen - visible_ids):
                 ident = html.escape(missing, quote=True)
-                rows.append(f"<div class=chat data-id='{ident}' data-type='unavailable' data-search='{ident} unavailable'><input type=checkbox name=chat value='{ident}' checked hidden><span class=chat-title>{ident} <small>Unavailable in latest refresh — selection is stored in chats.csv</small></span><label><input type=checkbox class=group-membership checked onchange='saveGroupMembership(this)'> In this group</label></div>")
+                group = html.escape(str(catalog.chat_group(state, str(missing)) or ''), quote=True)
+                rows.append(f"<div class=chat data-id='{ident}' data-group='{group}' data-active='no' data-type='unavailable' data-search='{ident} unavailable'><input type=checkbox name=chat value='{ident}' checked hidden><span class=chat-title>{ident} <small>Unavailable in latest refresh — selection is stored in chats.csv</small></span><label><input type=checkbox class=group-membership {'checked' if group == 'ungrouped' else ''} onchange='saveGroupMembership(this)'> In this group</label></div>")
             schedule = state.get("schedule", {})
             retention = state.get("retention", {})
             retention_checked = "checked" if retention.get("enabled") else ""
@@ -595,17 +723,7 @@ def make_handler(runtime: Runtime, token: str):
                 lan_html = f"<p>LAN access is off. Supply a trusted certificate for a stable DNS hostname; install the LAN extra first. A browser must trust the certificate to use a passkey.</p><form method=post action=/lan-start><input type=hidden name=token value='{token}'><label>Private local IP <input name=bind_ip placeholder='192.168.1.20' required></label><label>HTTPS origin <input name=origin placeholder='https://archive.example:8443' required></label><label>Certificate path <input name=certificate required></label><label>Private key path <input name=private_key required></label><button>Start LAN access</button></form>"
             selected_time = html.escape(schedule.get("time", "03:15"), quote=True)
             last_started = html.escape(str(state.get("job", {}).get("started_at", "")), quote=True)
-            last_export_rows = []
-            for key, kind_label in (("last_export_messages", "New messages"), ("last_export_recent", "Recent period"), ("last_export_snapshot", "Snapshot")):
-                for result in state.get(key, {}).get("result", []):
-                    label = html.escape(str(result.get("chat_title") or result.get("chat_id") or "Chat"))
-                    path = result.get("path")
-                    detail = f"{html.escape(str(path))} — {int(result.get('messages', 0))} messages" if path else "No messages in this export"
-                    last_export_rows.append(f"<li>{kind_label}, {label}: {detail}</li>")
-            member_result = state.get("last_export_group_members", {}).get("result", {})
-            if isinstance(member_result, dict) and member_result.get("path"):
-                last_export_rows.append(f"<li>Group members: {html.escape(str(member_result['path']))} — {int(member_result.get('members_exported', 0))} members</li>")
-            last_export_html = "".join(last_export_rows)
+            last_export_html = "".join(f"<li>{html.escape(line)}</li>" for line in _recent_export_lines(state))
             block_rows = []
             block_options = []
             for block_id, block in state.get("blocks", {}).items():
@@ -661,6 +779,16 @@ def make_handler(runtime: Runtime, token: str):
                 old_archive_html = f"<section><h2>Старый архив не найден</h2><p>{html.escape(str(legacy_archive.DEFAULT_DB))}</p></section>"
             password_field = "<label>ZIP password (optional) <input type=password name=archive_password autocomplete=new-password></label>"
             lan_section = "" if self.headers.get("X-Signal-Remote") == "1" else f"<details data-page=settings hidden><summary>LAN access and paired devices</summary>{lan_html}</details>"
+            folder_options = ''.join(
+                f"<option value='{html.escape(str(folder['id']), quote=True)}'>{html.escape(str(folder['name']))} ({len(folder.get('dialogs', []))})</option>"
+                for folder in state.get('telegram_folders', [])
+            )
+            folder_options = folder_options or '<option value="">Сначала загрузите папки</option>'
+            telegram_folders_html = (f"<section data-page=settings hidden {offline_disabled}><h2>Папки Telegram</h2>"
+                f"<p>Загрузите ваши папки, выберите нужную и проверьте конфликты перед импортом. Telegram не изменится.</p>"
+                f"<form method=post action=/telegram-folders-refresh onsubmit=\"return rememberRefresh('fetch Telegram folders')\"><input type=hidden name=token value='{token}'><button>Загрузить папки Telegram</button></form>"
+                f"<form method=post action=/telegram-folder-preview><input type=hidden name=token value='{token}'><p><label>Папка <select name=folder required>{folder_options}</select></label> <button>Проверить и добавить</button></p></form>"
+                f"<small>Динамические фильтры могут пропустить чаты, если Telegram не предоставил нужные сведения.</small></section>")
 
             stored_problems = {str(key) for key in state.get("problem_chats", {})}
             def problem_row(item):
@@ -669,13 +797,16 @@ def make_handler(runtime: Runtime, token: str):
                 kind = html.escape(str(item["type"]))
                 message = html.escape(str(item["message"]))
                 groups = html.escape(", ".join(item["groups"]))
+                link = item.get("link", "")
+                title_html = f'<a href="{html.escape(link, quote=True)}" target="_blank" rel="noopener noreferrer">{title} ↗</a>' if link else title
+                pending = item.get("pending_request", False)
                 choose = (f'<label><input type=checkbox name=problem_chat value="{ident}"> В экспорт участников</label>'
                           if item["selectable"] else "")
                 resolve = ""
                 if str(item["id"]) in stored_problems:
                     resolve = (f'<form method=post action=/problem-resolve><input type=hidden name=token value="{token}">'
                                f'<input type=hidden name=chat_id value="{ident}"><button class=secondary>Убрать</button></form>')
-                return (f'<div class=problem-row><span><b>{title}</b> <small>{kind}'
+                return (f'<div class="problem-row{" pending" if pending else ""}"><span><b>{title_html}</b> <small>{kind}'
                         + (f" · {groups}" if groups else "") + f'</small><br><small class=problem-reason>{message}</small></span>'
                         + f'<span>{choose}{resolve}</span></div>')
 
@@ -683,11 +814,13 @@ def make_handler(runtime: Runtime, token: str):
                 return "".join(problem_row(item) for item in items) or f"<p><small>{empty}</small></p>"
 
             if problems["all"]:
-                problem_tab = (f'<button class="page-tab problem-tab" data-target=problems aria-selected=false '
-                               f'onclick="showPage(\'problems\')">Проблемные чаты ({len(problems["all"])})</button>')
+                has_pending = any(item.get("pending_request") for item in problems["all"])
+                tab_class = "page-tab problem-tab" if has_pending else "page-tab"
+                problem_tab = (f'<button class="{tab_class}" data-target=problems aria-selected=false '
+                               f'onclick="showPage(\'problems\')">Неактивные ({len(problems["all"])})</button>')
                 problem_section = (
-                    f'<section data-page=problems {offline_disabled}><h2>Проблемные чаты</h2>'
-                    '<p>Красная вкладка появляется только когда есть чаты, требующие внимания.</p>'
+                    f'<section data-page=problems hidden {offline_disabled}><h2>Неактивные чаты</h2>'
+                    '<p>Красным отмечены отправленные запросы на вступление, ожидающие одобрения.</p>'
                     '<h3>Требуют внимания</h3><p><small>Не ответившие боты, чаты с 0 сообщений и группы/каналы с неподтверждённым запросом на вступление.</small></p>'
                     f'<div class=chat-list>{problem_list(problems["urgent"], "Проблем пока нет.")}</div>'
                     f'<h3>Нет сообщений больше {problems["days"]} дней</h3>'
@@ -700,26 +833,35 @@ def make_handler(runtime: Runtime, token: str):
             else:
                 problem_tab = ""
                 problem_section = ""
+            accent_color = str(state.get("accent_color", "#65d6c0"))
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", accent_color):
+                accent_color = "#65d6c0"
+            rgb = tuple(int(accent_color[i:i+2], 16) for i in (1, 3, 5))
+            # Relative luminance controls button text contrast for custom colors.
+            linear = [v / 3294.6 if v / 255 <= 0.04045 else ((v / 255 + 0.055) / 1.055) ** 2.4 for v in rgb]
+            ink = "#111111" if sum(a*b for a, b in zip(linear, (0.2126, 0.7152, 0.0722))) > 0.179 else "#ffffff"
             self.send(f'''<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Signal Archive</title><style>
-            :root{{color-scheme:dark;--panel:#172331;--line:#304357;--muted:#a7bbcb;--accent:#65d6c0}}*{{box-sizing:border-box}}body{{font:16px/1.5 system-ui,sans-serif;background:#0c1520;color:#edf5f8;max-width:1000px;margin:auto;padding:28px}}h1{{font-size:2rem;margin-bottom:0}}h2{{font-size:1.2rem;margin-top:0}}h3{{font-size:1rem}}section{{background:var(--panel);padding:22px;border:1px solid var(--line);border-radius:16px;margin:16px 0;box-shadow:0 8px 24px #0003}}button,input,select{{font:inherit}}button{{background:var(--accent);color:#07231e;border:0;border-radius:9px;padding:10px 16px;font-weight:650;cursor:pointer}}button:hover{{filter:brightness(1.12)}}button.secondary{{background:#263c4d;color:#e6f4f5}}input:not([type=checkbox]),select{{background:#101d2a;color:inherit;border:1px solid #52697b;border-radius:8px;padding:9px}}input[type=checkbox]{{accent-color:var(--accent);width:18px;height:18px;vertical-align:middle}}.chat-list{{max-height: min(55vh, 32rem);overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column}}.recent-list{{max-height:12rem;overflow-y:auto;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:10px}}.recent-list ul{{padding-right:16px}}.chat{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-bottom:1px solid var(--line)}}.chat label{{display:flex;align-items:center;gap:10px}}.chat-title{{display:flex;align-items:center;gap:10px;flex:1;min-width:0}}.chat:last-child{{border-bottom:0}}.chat:has(input[name="chat"]:checked){{order:-1}}dialog{{background:var(--panel);color:inherit;border:1px solid var(--line);border-radius:16px;max-width:min(95vw,600px)}}dialog::backdrop{{background:#000a}}.tabs{{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}}[aria-selected=true]{{outline:2px solid white}}.problem-tab{{background:#8c2f2f;color:#fff;font-weight:750}}.problem-tab[aria-selected=true]{{outline:3px solid #ff9b9b}}.problem-row{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px;border-bottom:1px solid var(--line)}}.problem-row:last-child{{border-bottom:0}}.problem-reason{{color:#ffb3b3}}[hidden]{{display:none!important}}small{{color:var(--muted)}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}.activity{{border-color:var(--accent)}}#status{{background:#0e1b27;padding:14px;border-radius:9px;margin:0 0 12px}}a{{color:#83e4d2;text-decoration:none}}a:hover{{text-decoration:underline}}summary{{cursor:pointer;color:#a1ddd3;margin-top:16px}}@media(max-width:600px){{body{{padding:12px}}section{{padding:16px}}.chat{{align-items:flex-start;flex-wrap:wrap}}}}
-            </style></head><body><h1>Signal Archive</h1><p>Text-only Telegram exports on this computer. <a href='/codex-guide' title='Codex archive analysis guide'>(i) Codex guide</a></p>{offline_notice}<nav class=tabs role=tablist aria-label='Pages'><button class=page-tab data-target=main aria-selected=true onclick="showPage('main')">Chats and export</button>{problem_tab}<button class=page-tab data-target=settings aria-selected=false onclick="showPage('settings')">Settings</button></nav>
-            {shortcut_offer}{catalog_conflict}<section class=activity><h2>Latest activity</h2><pre id=status role=status aria-live=polite>Checking activity…</pre><form method=post action=/cancel><input type=hidden name=token value='{token}'><button class=secondary>Stop current operation</button></form><small>Progress updates automatically. Completed files stay in the export folder.</small><form method=post action=/shutdown onsubmit="return confirm('Close Signal Archive? Any running export will stop.')"><input type=hidden name=token value='{token}'><p><button class=secondary>Close Signal Archive</button></p></form></section>{lan_section}
-            <details data-page=settings hidden><summary>Shortcuts and access</summary><p>Create a shortcut to start Signal Archive or open its existing browser interface.</p><form method=post action=/shortcut><input type=hidden name=token value='{token}'><button name=location value=desktop>Create desktop shortcut</button> <button name=location value=application>Create shortcut in application folder</button></form><small>The preview uses a browser for compatibility. The interface is currently accessible only on this computer. <a href='https://qna.habr.com/q/800445' target=_blank rel='noopener noreferrer'>About local network access</a></small></details>
-            <section data-page=main {hidden_live} {offline_disabled}><h2>Export</h2><p>{len(chosen)} chats selected. No media files are downloaded.</p><form method=post action=/export onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> <button>Export through now</button></form><details><summary>More export options</summary><p>Choose a specific time interval.</p><form method=post action=/interval onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>From <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label> <label>To <input type=datetime-local name=end required></label> <button>Export interval</button></form></details><p>Files: {html.escape(str(runtime.service.exports))}</p><form method=post action=/open-exports><input type=hidden name=token value='{token}'><button>Open export folder</button></form><form method=post action=/members-batch><input type=hidden name=token value='{token}'><label><input type=checkbox name=enrich_profiles value=yes {member_enrichment_checked}> Also fetch bios and personal channels (slower)</label> <label>Plan <input name=plan placeholder='optional' maxlength=200></label> <button name=scope value=all_groups>Export members of all groups</button> <button class=secondary name=scope value=selected_groups>Export members of selected groups</button></form><h3>Most recent successful exports</h3><div class=recent-list tabindex=0 aria-label="Most recent successful exports"><ul>{last_export_html or '<li>No successful export yet.</li>'}</ul></div></section>
-            {old_archive_html}
-            <section data-page=settings hidden><h2>Schedule</h2><form method=post action=/schedule><input type=hidden name=token value='{token}'><label><input type=checkbox name=enabled value=yes {checked}> Daily while the app is running</label> <input type=time name=time value='{selected_time}' required> <button>Save schedule</button></form><small>If the app was closed at the scheduled time, it runs when reopened.</small><form method=post action=/encryption><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {encryption_checked}> Password-protect all new ZIP archives</label> <input type=password name=password autocomplete=new-password placeholder="Archive password"> <button>Save encryption</button></p><small>Stored in the OS keyring for scheduled exports. AES ZIP needs a compatible archive reader.</small></form><form method=post action=/retention><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {retention_checked}> Delete app-created archives older than</label> <input type=number name=days min=1 max=36500 value='{retention_days}' required> days <button>Save retention</button></p></form><form method=post action=/problem-settings><input type=hidden name=token value='{token}'><p><label>чаты в проблемные через N дней <input type=number name=days min=1 max=3650 value='{problem_days_value}' required></label> <button>Сохранить</button></p></form><form method=post action=/switch-session onsubmit="return confirm('Сменить сессию? Приложение закроется. При смене аккаунта прежний список чатов будет сохранён в резервной копии, а для нового аккаунта создан отдельный список. Экспорты сохранятся.')"><input type=hidden name=token value='{token}'><p><button class=secondary>Сменить сессию</button> <small>Использовать другую сессию или аккаунт; старый файл Telegram Archive не удаляется.</small></p></form><form method=post action=/autostart><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {startup_checked}> Start Signal Archive when I sign in</label> <button>Save startup setting</button></p></form><small>{html.escape(startup_note)}</small></section>
+            :root{{color-scheme:dark;--panel:#172331;--line:#304357;--muted:#a7bbcb;--accent:{accent_color};--accent-ink:{ink}}}*{{box-sizing:border-box}}body{{font:16px/1.5 system-ui,sans-serif;background:#0c1520;color:#edf5f8;max-width:1000px;margin:auto;padding:28px}}h1{{font-size:2rem;margin-bottom:0}}h2{{font-size:1.2rem;margin-top:0}}h3{{font-size:1rem}}section{{background:var(--panel);padding:22px;border:1px solid var(--line);border-radius:16px;margin:16px 0;box-shadow:0 8px 24px #0003}}button,input,select{{font:inherit}}button{{background:var(--accent);color:var(--accent-ink);border:0;border-radius:9px;padding:10px 16px;font-weight:650;cursor:pointer}}button:hover{{filter:brightness(1.12)}}button.secondary{{background:#263c4d;color:#e6f4f5}}input:not([type=checkbox]),select{{background:#101d2a;color:inherit;border:1px solid #52697b;border-radius:8px;padding:9px}}input[type=checkbox]{{accent-color:var(--accent);width:18px;height:18px;vertical-align:middle}}.chat-list{{max-height: min(55vh, 32rem);overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column}}.recent-list{{max-height:12rem;overflow-y:auto;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:10px}}.recent-list ul{{padding-right:16px}}.chat{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-bottom:1px solid var(--line)}}.chat label{{display:flex;align-items:center;gap:10px}}.chat-title{{display:flex;align-items:center;gap:10px;flex:1;min-width:0}}.chat:last-child{{border-bottom:0}}.chat:has(input[name="chat"]:checked){{order:-1}}dialog{{background:var(--panel);color:inherit;border:1px solid var(--line);border-radius:16px;max-width:min(95vw,600px)}}dialog::backdrop{{background:#000a}}.tabs{{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}}[aria-selected=true]{{outline:2px solid white}}.problem-tab{{background:#8c2f2f;color:#fff;font-weight:750}}.problem-tab[aria-selected=true]{{outline:3px solid #ff9b9b}}.problem-row{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px;border-bottom:1px solid var(--line)}}.problem-row:last-child{{border-bottom:0}}.problem-reason{{color:var(--muted)}}.problem-row.pending .problem-reason{{color:#ffb3b3}}[hidden]{{display:none!important}}small{{color:var(--muted)}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}.activity{{border-color:var(--accent)}}#status{{background:#0e1b27;padding:14px;border-radius:9px;margin:0 0 12px}}a{{color:#83e4d2;text-decoration:none}}a:hover{{text-decoration:underline}}summary{{cursor:pointer;color:#a1ddd3;margin-top:16px}}.chat-toolbar{{position:sticky;top:0;z-index:3;background:var(--panel);padding:10px 0;display:flex;gap:8px;align-items:flex-start}}.search-wrap{{position:relative;flex:1;min-width:180px}}.search-wrap input{{width:100%}}.suggestions{{position:absolute;top:100%;left:0;z-index:4;background:#101d2a;border:1px solid var(--line);border-radius:8px;padding:6px;box-shadow:0 8px 20px #0007}}.suggestions button{{display:block;width:100%;text-align:left;padding:6px}}.chat-add{{display:flex;gap:6px}}.activity{{position:fixed;bottom:14px;right:14px;z-index:9;margin:0;padding:10px 14px;max-width:min(350px,90vw);max-height:60vh;overflow:auto}}.activity summary{{margin:0}}.activity.running summary:before{{content:"";display:inline-block;width:10px;height:10px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;margin-right:8px;animation:spin 1s linear infinite}}@keyframes spin{{to{{transform:rotate(360deg)}}}}@media(prefers-reduced-motion:reduce){{.activity.running summary:before{{animation:none}}}}@media(max-width:600px){{body{{padding:12px}}section{{padding:16px}}.chat{{align-items:flex-start;flex-wrap:wrap}}.chat-toolbar{{flex-wrap:wrap}}.chat-add{{width:100%}}}}
+            .workspace{{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(280px,.8fr);gap:18px;align-items:start}}.workspace>section{{min-width:0;margin-top:0}}.workspace .chats-panel{{grid-column:1;grid-row:1}}.workspace .export-panel{{grid-column:2;grid-row:1;position:sticky;top:12px}}.export-action{{display:block;width:100%;min-height:88px;margin:10px 0;text-align:left;font-size:1.04rem;border-radius:12px;box-shadow:inset 0 -5px 0 #0003,0 4px 12px #0003;transition:transform .18s,filter .18s}}.export-action:hover{{transform:translateY(-2px)}}.export-action:active{{transform:translateY(2px)}}.path-form{{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}}.path-link{{background:none;color:var(--accent);padding:0;border:0;font-weight:normal;text-align:left;overflow-wrap:anywhere;text-decoration:underline}}.tabs[role=tablist]{{gap:2px;border-bottom:1px solid var(--line)}}.group-tab{{border-radius:9px 9px 0 0;background:#263c4d;color:#e6f4f5}}.group-tab[aria-selected=true]{{background:var(--accent);color:var(--accent-ink);outline:none}}.topbar{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:8;background:#0c1520;padding:10px 0}}.topbar .chat-toolbar{{position:static;background:transparent;padding:0;flex:1;min-width:280px}}.topbar h1{{font-size:1.5rem;margin:0}}.topbar .tabs{{margin:0;flex:1}}.toplinks{{display:flex;gap:10px;flex-wrap:wrap;font-size:.88rem}}@media(max-width:760px){{.workspace{{display:flex;flex-direction:column}}.workspace>section{{width:100%}}.workspace .export-panel{{position:static}}.workspace .chats-panel{{order:0}}.workspace .export-panel{{order:1}}}}@media(prefers-reduced-motion:reduce){{.export-action{{transition:none}}}}
+            </style></head><body><header class=topbar><h1>Signal Archive</h1><div class=toplinks><a href='/codex-guide' title='Codex archive analysis guide'>(i) Codex guide</a> · <a href='/training'>Обучение</a> · <a href='https://t.me/ahdpeee' target=_blank rel='noopener noreferrer'>Автор</a> · <a href='https://github.com/aHDpeee/messagesAutomation' target=_blank rel='noopener noreferrer'>GitHub и участие</a></div><a id=schedule-summary href='#schedule-settings' onclick="showPage('settings')" aria-label='Расписание экспорта'></a><nav class=tabs role=tablist aria-label='Pages'><button class=page-tab data-target=main aria-selected=true onclick="showPage('main')">Chats and export</button>{problem_tab}<button class=page-tab data-target=settings aria-selected=false onclick="showPage('settings')">Settings</button></nav><div class=chat-toolbar data-page=main {hidden_live} {offline_disabled}><div class=search-wrap><input id=search placeholder='Поиск чатов' autocomplete=off oninput='filter()' onfocus="document.getElementById('search-suggestions').hidden=false" onblur="setTimeout(()=>document.getElementById('search-suggestions').hidden=true,200)"><div id=search-suggestions class=suggestions hidden><button type=button class=secondary onclick="useSearchToken('@group')">@group — группы</button><button type=button class=secondary onclick="useSearchToken('@channel')">@channel — каналы</button><button type=button class=secondary onclick="useSearchToken('@chat')">@chat — личные чаты</button><button type=button class=secondary onclick="useSearchToken('@active')">@active — активные</button></div></div><form class=chat-add method=post action=/add-chat onsubmit="return rememberRefresh('add chat')"><input type=hidden name=token value='{token}'><input name=reference placeholder='Ссылка, @username или ID' required><button>Добавить</button></form></div></header>{offline_notice}
+            {shortcut_offer}{catalog_conflict}<details id=activity class=activity><summary>Операция: <span id=status-short>Проверка…</span></summary><pre id=status role=status aria-live=polite>Checking activity…</pre><form method=post action=/cancel><input type=hidden name=token value='{token}'><button class=secondary>Stop current operation</button></form><h3>Последние успешные экспорты</h3><div class=recent-list tabindex=0 aria-label="Most recent successful exports"><ul id=recent-exports>{last_export_html or "<li>Пока нет завершённых экспортов.</li>"}</ul></div><small>Progress updates automatically. Completed files stay in the export folder.</small><form method=post action=/shutdown onsubmit="return confirm('Close Signal Archive? Any running export will stop.')"><input type=hidden name=token value='{token}'><p><button class=secondary>Close Signal Archive</button></p></form></details>{lan_section}
+            {telegram_folders_html}<details data-page=settings hidden><summary>Shortcuts and access</summary><p>Create a shortcut to start Signal Archive or open its existing browser interface.</p><form method=post action=/shortcut><input type=hidden name=token value='{token}'><button name=location value=desktop>Create desktop shortcut</button> <button name=location value=application>Create shortcut in application folder</button></form><small>The preview uses a browser for compatibility. The interface is currently accessible only on this computer. <a href='https://qna.habr.com/q/800445' target=_blank rel='noopener noreferrer'>About local network access</a></small></details>
 
-            <section data-page=main {hidden_live} {offline_disabled}><h2>Choose chats</h2><form id=refreshForm data-started='{last_started}' method=post action=/refresh onsubmit='return rememberRefresh()'><input type=hidden name=token value='{token}'><button>Refresh Telegram chats</button></form><form method=post action=/add-chat onsubmit="return rememberRefresh('add chat')"><input type=hidden name=token value='{token}'><input name=reference placeholder='Chat link, @username, ID or name' required><button>Add chat</button></form><p id=selectionNotice role=status></p><p><input id=search placeholder='Search chats' oninput='filter()'></p><p><button type=button onclick='selectVisible(true)'>Select visible</button> <button type=button onclick='selectVisible(false)'>Clear visible</button></p>
+            {old_archive_html}
+            <section id=schedule-settings data-page=settings hidden><h2>Schedule</h2><form method=post action=/schedule><input type=hidden name=token value='{token}'><label><input type=checkbox name=enabled value=yes {checked}> Daily while the app is running</label> <input type=time name=time value='{selected_time}' required> <button>Save schedule</button></form><small>If the app was closed at the scheduled time, it runs when reopened.</small><form method=post action=/encryption><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {encryption_checked}> Password-protect all new ZIP archives</label> <input type=password name=password autocomplete=new-password placeholder="Archive password"> <button>Save encryption</button></p><small>Stored in the OS keyring for scheduled exports. AES ZIP needs a compatible archive reader.</small></form><form method=post action=/retention><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {retention_checked}> Delete app-created archives older than</label> <input type=number name=days min=1 max=36500 value='{retention_days}' required> days <button>Save retention</button></p></form><form method=post action=/problem-settings><input type=hidden name=token value='{token}'><p><label>Считать чаты неактивными через N дней <input type=number name=days min=1 max=3650 value='{problem_days_value}' required></label> <button>Сохранить</button></p></form><form method=post action=/switch-session onsubmit="return confirm('Сменить сессию? Приложение закроется. При смене аккаунта прежний список чатов будет сохранён в резервной копии, а для нового аккаунта создан отдельный список. Экспорты сохранятся.')"><input type=hidden name=token value='{token}'><p><button class=secondary>Сменить сессию</button> <small>Использовать другую сессию или аккаунт; старый файл Telegram Archive не удаляется.</small></p></form><form method=post action=/autostart><input type=hidden name=token value='{token}'><p><label><input type=checkbox name=enabled value=yes {startup_checked}> Start Signal Archive when I sign in</label> <button>Save startup setting</button></p></form><small>{html.escape(startup_note)}</small></section>
+
+            <div class=workspace><section class=chats-panel data-page=main {hidden_live} {offline_disabled}><h2>Чаты</h2><form id=refreshForm data-started='{last_started}' method=post action=/refresh onsubmit='return rememberRefresh()'><input type=hidden name=token value='{token}'><button>Refresh Telegram chats</button></form><p id=selectionNotice role=status></p>
             <small>Member lists contain only data visible to your account.</small>
             <dialog id=single-dialog aria-labelledby=single-chat-title><h2 id=single-chat-title>Export chat</h2><form id=single-export method=post action=/single-export><input type=hidden name=token value='{token}'><input id=single-chat-id type=hidden name=chat_id><p><label>From <input id=single-start type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label></p><p><label>To (leave blank for now) <input id=single-end type=datetime-local name=end></label></p>{password_field}<p><button>Export chat</button> <button type=button class=secondary onclick="document.getElementById('single-dialog').close()">Cancel</button></p><small>Dates are remembered for this chat. Passwords are not saved here.</small></form></dialog><p>Chat catalog: {html.escape(str(runtime.service.home / 'chats.csv'))}</p>
-            <p>Selected chats are shown first. The export checkbox is kept in the catalog instead of being shown here; use <b>Select visible</b>, <b>Clear visible</b>, <b>Select whole blocks</b> or edit <code>chats.csv</code> to change it. Check <b>In this group</b> to change group membership.</p><nav class=tabs role=tablist aria-label='Chat groups'><button type=button class=group-tab role=tab aria-selected=true onclick="showGroup('ungrouped',this)">Ungrouped</button>{group_tabs}</nav><p id=group-notice role=status></p><input id=group-catalog-hash type=hidden value='{catalog_hash}'><form method=post action=/select><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><p>Select whole blocks: {block_select_html or 'No blocks yet.'}</p><div class=chat-list tabindex=0 aria-label='Chat list'>{''.join(rows) or '<p>Refresh the list to see your Telegram chats.</p>'}</div><p><button>Save selection</button></p></form></section>
+            <nav class=tabs role=tablist aria-label='Chat groups'><button type=button class=group-tab role=tab aria-selected=true onclick="showGroup('ungrouped',this)">Ungrouped</button>{group_tabs}<button type=button aria-label='Create group' onclick="document.getElementById('new-group-dialog').showModal()">+</button></nav><dialog id=new-group-dialog><h2>Новая группа</h2><form method=post action=/block-create><input type=hidden name=token value='{token}'><label>Название <input name=name maxlength=100 required></label><p><button>Создать</button> <button type=button class=secondary onclick="document.getElementById('new-group-dialog').close()">Отмена</button></p></form></dialog><p id=group-notice role=status></p><input id=group-catalog-hash type=hidden value='{catalog_hash}'><div class=chat-list tabindex=0 aria-label='Chat list'>{''.join(rows) or '<p>Refresh the list to see your Telegram chats.</p>'}</div><p><small>Отметь чат на вкладке группы, чтобы включить его в экспорт. Один чат может находиться только в одной группе; Ungrouped сохраняется в корень архива. Без группы чат не экспортируется. Поиск @active показывает чаты с сообщениями за последние {problem_days_value} дней.</small></p></section>
+            <section class=export-panel data-page=main {hidden_live} {offline_disabled}><h2>Экспорт</h2><p><span id=selected-count>{len(chosen)}</span> чатов выбрано · без медиа</p><form method=post action=/export onsubmit='return ensureSelectionSaved()'><input type=hidden name=token value='{token}'><input type=hidden name=selection value='{selection_hash}'><label>Начиная с <input type=datetime-local name=start value='{start_value}' data-default-instant='{default_start.isoformat()}' required></label><button class=export-action>Экспортировать сообщения</button></form><form class=path-form method=post action=/open-exports><input type=hidden name=token value='{token}'><span>Папка: </span><button class=path-link title='Открыть папку экспорта'>{html.escape(str(runtime.service.exports))}</button></form><form class=member-actions method=post action=/members-batch><input type=hidden name=token value='{token}'><input type=hidden name=enrich_profiles value='{"yes" if member_enrichment_checked else "no"}'><label>Метка плана <input name=plan maxlength=200 placeholder='необязательно'></label><button class=export-action name=scope value=all_groups>Участники всех групп</button><button class=export-action name=scope value=selected_groups>Участники выбранных групп</button></form></section></div>
             {problem_section}
             <section data-page=settings hidden><h2>Chat catalog</h2><p>CSV file: <code>{html.escape(str(runtime.service.home / 'chats.csv'))}</code></p><p id=catalog-status role=status>{catalog_notice}</p>
-            <p>Groups are stored per chat in the CSV <code>blocks</code> column. Enter one name or several names separated by commas; leave it empty for Ungrouped. For a group name containing a comma, use a JSON list such as <code>[&quot;Work, projects&quot;]</code>. The <code>type</code> column is the Telegram chat type, not the group. Replace or save the CSV and refresh this page to apply valid changes; you can also upload a CSV below. Invalid files are kept unchanged and reported.</p>
+            <p>Groups are stored per chat in the CSV <code>blocks</code> column. Enter one group name, or <code>Ungrouped</code> to export the chat to the ZIP root. Leave the field empty to exclude the chat from exports. For a group name containing a comma, use a JSON list such as <code>[&quot;Work, projects&quot;]</code>. The <code>type</code> column is the Telegram chat type, not the group. Replace or save the CSV and refresh this page to apply valid changes; you can also upload a CSV below. Invalid files are kept unchanged and reported.</p>
             <form method=post action=/catalog-reload onsubmit="previewCatalog(this,'reload'); return false"><input type=hidden name=token value='{token}'><input type=hidden name=expected_hash value='{catalog_hash}'><button>Reload from local CSV</button></form>
             <form method=post action=/catalog-upload onsubmit="previewCatalog(this,'upload'); return false"><input type=hidden name=token value='{token}'><input type=hidden name=expected_hash value='{catalog_hash}'><input type=hidden name=csv><label>Upload CSV <input type=file accept='.csv,text/csv' required></label> <button>Validate and upload</button></form>
             <form method=post action=/catalog-restore onsubmit="previewCatalog(this,'restore'); return false"><input type=hidden name=token value='{token}'><input type=hidden name=expected_hash value='{catalog_hash}'><label>Restore backup <select name=name required>{backup_options or '<option value="">No backups yet</option>'}</select></label> <button>Review and restore</button></form></section>
-            <section data-page=settings hidden><h2>Member export options</h2><form id=members method=post action=/members><input type=hidden name=token value='{token}'><label><input type=checkbox name=enrich_profiles value=yes {member_enrichment_checked}> Also fetch visible bios and personal channels (up to 100 profiles; slower)</label></form><small>These options apply when you use Export members next to a group. Phone numbers are included only when Telegram shows them.</small></section><section data-page=settings hidden><h2>Manage groups</h2><form method=post action=/block-create><input type=hidden name=token value='{token}'><input name=name placeholder='New block' maxlength=100 required> <button>Create block</button></form>{blocks_html}</section><script>{UI_SCRIPT}</script></body></html>''')
+            <section data-page=settings hidden><h2>Цвет интерфейса</h2><form method=post action=/theme><input type=hidden name=token value='{token}'><label>Акцент <input type=color name=accent value='{accent_color}'></label> <button>Сохранить цвет</button></form></section><section data-page=settings hidden><h2>Member export options</h2><form id=members method=post action=/members><input type=hidden name=token value='{token}'><label><input type=checkbox name=enrich_profiles value=yes {member_enrichment_checked}> Also fetch visible bios and personal channels (up to 100 profiles; slower)</label></form><small>These options apply when you use Export members next to a group. Phone numbers are included only when Telegram shows them.</small></section><section data-page=settings hidden><h2>Manage groups</h2><form method=post action=/block-create><input type=hidden name=token value='{token}'><input name=name placeholder='New block' maxlength=100 required> <button>Create block</button></form>{blocks_html}</section><script>{UI_SCRIPT}</script></body></html>''')
 
         def do_POST(self):
             origin = f"http://127.0.0.1:{self.server.server_port}"
@@ -755,23 +897,12 @@ def make_handler(runtime: Runtime, token: str):
                         if checked not in {"yes", "no"}:
                             raise ValueError("Invalid group membership.")
                         def mutate(state):
-                            catalog.expand_selection(state, [chat_id], [])
-                            blocks = state.get("blocks", {})
-                            if group == "ungrouped":
-                                if checked != "yes":
-                                    raise ValueError("Choose a named group to move a chat out of Ungrouped.")
-                                for block in blocks.values():
-                                    block["chat_ids"] = [item for item in block.get("chat_ids", []) if str(item) != chat_id]
-                            else:
-                                if group not in blocks:
-                                    raise ValueError("Group not found. Reload the page.")
-                                ids = [str(item) for item in blocks[group].get("chat_ids", []) if str(item) != chat_id]
-                                if checked == "yes":
-                                    ids.append(chat_id)
-                                catalog.assign_block(state, group, ids)
+                            current = catalog.chat_group(state, chat_id)
+                            if checked == "no" and current != group:
+                                raise ValueError("Chat group changed. Reload the page.")
+                            catalog.set_chat_group(state, chat_id, group if checked == "yes" else None)
                         service.mutate_catalog(mutate)
-                        groups = [key for key, block in service.state.get("blocks", {}).items() if chat_id in block.get("chat_ids", [])]
-                        return {"groups": groups, "hash": catalog._file_hash(service.catalog_path)}
+                        return {"group": catalog.chat_group(service.state, chat_id), "selected_count": len(service.state["selected"]), "selection_hash": selection_fingerprint(service.state["selected"]), "hash": catalog._file_hash(service.catalog_path)}
                     try:
                         result = runtime.call(change_membership)
                         self.send(json.dumps(result), content_type="application/json; charset=utf-8")
@@ -986,6 +1117,31 @@ def make_handler(runtime: Runtime, token: str):
                         else:
                             catalog.assign_block(state, form["block"][0], form.get("chat", []))
                     runtime.call(lambda: runtime.service.mutate_catalog(update_block))
+                elif self.path == "/telegram-folders-refresh":
+                    runtime.submit(runtime.service.fetch_telegram_folders)
+                    self.send_response(303); self.send_header("Location", "/#settings"); self.end_headers(); return
+                elif self.path == "/telegram-folder-preview":
+                    folder_id = form.get("folder", [""])[0]
+                    preview = runtime.call(lambda: runtime.service.preview_telegram_folder(folder_id))
+                    conflicts = ''.join(f"<li>{html.escape(c['title'])} — {html.escape(c['group'])}</li>" for c in preview['conflicts'])
+                    if conflicts:
+                        choice = ("<p>Эти чаты уже назначены в другую группу:</p><ul>" + conflicts + "</ul>"
+                                  "<label><input type=radio form=folder-import name=strategy value=keep required> Оставить в прежней группе</label><br>"
+                                  "<label><input type=radio form=folder-import name=strategy value=move required> Переместить в импортируемую группу</label>")
+                    else:
+                        choice = "<p>Конфликтов нет.</p><input type=hidden form=folder-import name=strategy value=keep>"
+                    self.send("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                        "<title>Импорт папки Telegram</title><h1>Импорт папки Telegram</h1><p>" +
+                        html.escape(preview['name']) + ": " + str(preview['total']) + " чатов. Не удалось определить: " + str(preview['uncertain']) + ".</p>" +
+                        choice + f"<form id=folder-import method=post action=/telegram-folder-import><input type=hidden name=token value='{token}'>"
+                        f"<input type=hidden name=folder value='{html.escape(folder_id, quote=True)}'>"
+                        f"<input type=hidden name=fingerprint value='{preview['fingerprint']}'>" +
+                        ("" if not conflicts else "<p>Выберите решение выше перед подтверждением.</p>") +
+                        "<button>Подтвердить импорт</button></form><p><a href='/#settings'>Отмена</a></p>")
+                    return
+                elif self.path == "/telegram-folder-import":
+                    runtime.call(lambda: runtime.service.import_telegram_folder(form.get("folder", [""])[0], form.get("strategy", [""])[0], form.get("fingerprint", [""])[0]))
+                    self.send_response(303); self.send_header("Location", "/#settings"); self.end_headers(); return
                 elif self.path == "/schedule":
                     value = form.get("time", [""])[0]
                     if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
@@ -999,6 +1155,14 @@ def make_handler(runtime: Runtime, token: str):
                     enabled = form.get("enabled") == ["yes"]
                     password = form.get("password", [""])[0]
                     runtime.call(lambda: runtime.service.configure_encryption(enabled, password))
+                elif self.path == "/theme":
+                    color = form.get("accent", [""])[0]
+                    if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                        raise ValueError("Choose a valid accent color.")
+                    def save_theme():
+                        runtime.service.state["accent_color"] = color.lower()
+                        runtime.service.save()
+                    runtime.call(save_theme)
                 elif self.path == "/retention":
                     days = int(form.get("days", ["30"])[0])
                     if not 1 <= days <= 36500:

@@ -28,8 +28,10 @@ class MemberExportIntegrationTests(unittest.TestCase):
             root = Path(temporary)
             service = DirectService(Client(), root / "state", root / "exports")
             def setup(state):
+                from signal_archive import catalog as catalog_module
                 state["dialogs"] = [{"id": "123", "title": "Group", "type": "group"}]
-                state["blocks"] = {"old": {"name": "Old", "chat_ids": ["123"]}}
+                group = catalog_module.create_block(state, "Old")
+                catalog_module.set_chat_group(state, "123", group)
             service.mutate_catalog(setup)
             catalog = service.catalog_path
             catalog.write_text(catalog.read_text(encoding="utf-8-sig").replace(",Old,", ",New,"), encoding="utf-8-sig")

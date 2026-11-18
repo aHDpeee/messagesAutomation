@@ -10,12 +10,13 @@ class CatalogTests(unittest.TestCase):
     def setUp(self):
         self.state = {"dialogs": [{"id": "1", "title": "Alice", "type": "chat", "username": "alice", "added_at": "yesterday", "added_via": "link", "members_exported_at": "today"}, {"id": "2", "title": "=Danger", "type": "group"}], "selected": ["1"]}
 
-    def test_blocks_allow_shared_chats_and_remove_without_removing_chat(self):
+    def test_assigning_a_group_moves_chat_and_removal_keeps_catalog_record(self):
         a = catalog.create_block(self.state, "Work")
         b = catalog.create_block(self.state, "Friends")
         catalog.assign_block(self.state, a, ["1", "2", "1"])
         catalog.assign_block(self.state, b, ["1"])
-        self.assertEqual(self.state["blocks"][a]["chat_ids"], ["1", "2"])
+        self.assertEqual(self.state["blocks"][a]["chat_ids"], ["2"])
+        self.assertEqual(self.state["blocks"][b]["chat_ids"], ["1"])
         catalog.rename_block(self.state, b, "Family")
         with self.assertRaises(ValueError):
             catalog.rename_block(self.state, b, "work")

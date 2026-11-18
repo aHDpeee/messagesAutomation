@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any
 
 
@@ -42,9 +43,42 @@ def _entry(state: dict, record: dict, reason: str, message: str) -> dict[str, An
         "reason": reason,
         "message": message,
         "groups": _groups(state, ident),
+        "link": _chat_link(record),
+        "pending_request": reason == "requested" and str(record.get("type")) in {"group", "channel"} and _reference_link(record.get("reference")),
         # Only numeric group IDs can be used for the bulk member export.
         "selectable": str(record.get("type")) == "group" and ident.lstrip("-").isdigit(),
     }
+
+
+def _reference_link(reference: Any) -> bool:
+    from .chat_add import parse_chat_reference
+    if not reference:
+        return False
+    try:
+        kind, _ = parse_chat_reference(str(reference))
+    except ValueError:
+        return False
+    return kind in {"username", "invite"}
+
+
+def _chat_link(record: dict[str, Any]) -> str:
+    """Use only validated Telegram URLs; private chats without links stay plain."""
+    from .chat_add import parse_chat_reference
+    username = str(record.get("username") or "")
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", username):
+        return "https://t.me/" + username
+    for candidate in (record.get("reference"), record.get("link"), record.get("id")):
+        if not candidate:
+            continue
+        try:
+            kind, value = parse_chat_reference(str(candidate))
+        except ValueError:
+            continue
+        if kind == "username":
+            return "https://t.me/" + value
+        if kind == "invite":
+            return "https://t.me/+" + value
+    return ""
 
 
 def classify_problems(state: dict, *, now: datetime | None = None) -> dict[str, Any]:
@@ -67,6 +101,7 @@ def classify_problems(state: dict, *, now: datetime | None = None) -> dict[str, 
         record.setdefault("id", key)
         record.setdefault("title", stored.get("title") or key)
         record.setdefault("type", stored.get("type") or "group")
+        record.setdefault("reference", stored.get("reference") or key)
         reason = str(stored.get("reason") or "join_problem")
         message = str(stored.get("message") or "Требует внимания.")
         urgent.append(_entry(state, record, reason, message))
@@ -94,7 +129,7 @@ def classify_problems(state: dict, *, now: datetime | None = None) -> dict[str, 
 
 
 def record_problem(state: dict, ident: Any, *, title: str, kind: str,
-                   reason: str, message: str) -> None:
+                   reason: str, message: str, reference: str = "") -> None:
     key = str(ident)
     problems = state.setdefault("problem_chats", {})
     problems[key] = {
@@ -102,6 +137,7 @@ def record_problem(state: dict, ident: Any, *, title: str, kind: str,
         "type": str(kind or "group"),
         "reason": str(reason),
         "message": str(message)[:1000],
+        "reference": str(reference)[:2048],
     }
 
 

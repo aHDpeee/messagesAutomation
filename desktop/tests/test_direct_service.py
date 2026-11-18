@@ -12,6 +12,24 @@ from signal_archive.direct_export import ChatLookupError
 
 @unittest.skipUnless(importlib.util.find_spec("telethon"), "Telethon is not installed")
 class DirectServiceTests(unittest.TestCase):
+    def test_pause_is_shorter_after_an_empty_chat(self):
+        async def run(root):
+            service = DirectService(None, root, root / "exports")
+            service.state["dialogs"] = [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+            service.select(["1", "2", "3"])
+            async def fake_export(client, chat_id, out_dir, **kwargs):
+                if chat_id != 2:
+                    return {"last_id": 0, "path": None, "messages": 0}
+                path = out_dir / "chat-2.csv"
+                path.write_text("message", encoding="utf-8")
+                return {"last_id": 1, "path": str(path), "messages": 1}
+            with patch("signal_archive.direct_service.export_chat", fake_export), \
+                 patch("signal_archive.direct_service.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                await service.export_selected()
+            self.assertEqual([c.args[0] for c in sleep.await_args_list], [1, 2])
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(run(Path(tmp)))
+
     def test_default_export_bounds_start_and_remembers_selection(self):
         async def run(root):
             service = DirectService(None, root, root / "exports")

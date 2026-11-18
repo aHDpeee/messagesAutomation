@@ -78,9 +78,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("Export members", page)
         self.assertIn("action=/members>", page)
         self.assertIn("name=enrich_profiles value=yes", page)
-        for endpoint in ("export", "interval"):
-            self.assertIn(f"action=/{endpoint} onsubmit='return ensureSelectionSaved()'", page)
-        self.assertEqual(page.count("name=selection value="), 3)
+        self.assertIn("action=/export onsubmit='return ensureSelectionSaved()'", page)
+        self.assertNotIn("More export options", page)
+        self.assertEqual(page.count("name=selection value="), 1)
         self.assertNotIn("Export full snapshot", page)
         form = urlencode({"token": "test-token", "chat": "-1001", "selection": selection_fingerprint([])})
         response = self.request("POST", "/select", form, {"Origin": "http://127.0.0.1:8765"})
@@ -105,9 +105,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("data-start='2026-11-01T09:00'", page)
         self.assertIn("data-end='2026-11-02T10:00'", page)
 
-    def test_group_membership_is_separate_from_export_selection(self):
+    def test_group_membership_controls_export_selection(self):
         group = catalog.create_block(self.service.state, "Work")
-        self.service.state["selected"] = ["12"]
+        catalog.set_chat_group(self.service.state, "12", "ungrouped")
         catalog.write_catalog(self.service.state, self.service.catalog_path)
         expected = self.service.catalog_content()[1]
         origin = {"Origin": "http://127.0.0.1:8765"}
@@ -115,8 +115,8 @@ class WorkspaceTests(unittest.TestCase):
         reply = self.request("POST", "/group-membership", form, origin)
         self.assertIn("200 OK", reply)
         response = json.loads(reply.split("\r\n\r\n", 1)[1])
-        self.assertEqual(response["groups"], [group])
-        self.assertEqual(self.service.state["selected"], ["12"])
+        self.assertEqual(response["group"], group)
+        self.assertEqual(set(self.service.state["selected"]), {"12", "-1001"})
         self.assertIn("-1001", self.service.state["blocks"][group]["chat_ids"])
         stale = self.request("POST", "/group-membership", form, origin)
         self.assertIn("400 Bad Request", stale)
@@ -124,14 +124,16 @@ class WorkspaceTests(unittest.TestCase):
         reply = self.request("POST", "/group-membership", ungroup, origin)
         self.assertIn("200 OK", reply)
         self.assertEqual(self.service.state["blocks"][group]["chat_ids"], [])
-        self.assertEqual(self.service.state["selected"], ["12"])
+        self.assertEqual(set(self.service.state["selected"]), {"12", "-1001"})
 
-    def test_ungrouped_cannot_be_unchecked_without_a_target_group(self):
+    def test_unchecking_ungrouped_excludes_chat_from_export(self):
+        catalog.set_chat_group(self.service.state, "12", "ungrouped")
+        catalog.write_catalog(self.service.state, self.service.catalog_path)
         expected = self.service.catalog_content()[1]
         form = urlencode({"token": "test-token", "chat_id": "12", "group": "ungrouped", "checked": "no", "expected_hash": expected})
         reply = self.request("POST", "/group-membership", form, {"Origin": "http://127.0.0.1:8765"})
-        self.assertIn("400 Bad Request", reply)
-        self.assertIn("Choose a named group", reply)
+        self.assertIn("200 OK", reply)
+        self.assertNotIn("12", self.service.state["selected"])
 
     def test_catalog_controls_require_preview_and_show_path(self):
         page = self.request("GET", "/")
@@ -140,6 +142,37 @@ class WorkspaceTests(unittest.TestCase):
             self.assertIn(f"previewCatalog(this,'{operation}')", page)
         self.assertNotIn("id=catalog-editor", page)
         self.assertIn("data-page=settings hidden", page)
+
+    def test_telegram_folder_preview_submits_default_strategy_without_conflicts(self):
+        self.service.state["telegram_folders"] = [{"id": "2", "name": "Work", "dialogs": [{"id": "77", "title": "New chat", "type": "chat"}], "uncertain": 0}]
+        body = urlencode({"token": "test-token", "folder": "2"})
+        response = self.request("POST", "/telegram-folder-preview", body, {"Origin": "http://127.0.0.1:8765"})
+        self.assertIn("200 OK", response)
+        self.assertIn("form=folder-import name=strategy value=keep", response)
+        fingerprint = self.service.preview_telegram_folder("2")["fingerprint"]
+        body = urlencode({"token": "test-token", "folder": "2", "strategy": "keep", "fingerprint": fingerprint})
+        response = self.request("POST", "/telegram-folder-import", body, {"Origin": "http://127.0.0.1:8765"})
+        self.assertIn("303 See Other", response)
+        self.assertIn("77", self.service.state["selected"])
+
+    def test_main_page_has_compact_status_and_sticky_search_controls(self):
+        page = self.request("GET", "/")
+        self.assertIn("id=activity class=activity", page)
+        self.assertIn(".chat-toolbar{position:sticky", page)
+        self.assertIn("id=search-suggestions", page)
+        self.assertIn("class=workspace", page)
+        self.assertIn("class=export-panel", page)
+        self.assertIn("class=chats-panel", page)
+        self.assertIn("class=path-link", page)
+        self.assertIn("action=/theme", page)
+        self.assertLess(page.index("id=activity"), page.index("class=recent-list"))
+        self.assertLess(page.index("class=recent-list"), page.index("</details>", page.index("id=activity")))
+        for term in ("@group", "@channel", "@chat", "@active"):
+            self.assertIn(term, page)
+        self.assertIn("aria-label='Create group'", page)
+        self.assertIn("action=/add-chat", page)
+        self.assertNotIn("Select visible</button>", page)
+        self.assertIn("href='/training'", page)
 
     def test_external_catalog_edit_shows_conflict_notice(self):
         self.service.catalog_path.write_text("externally changed", encoding="utf-8")
@@ -237,7 +270,7 @@ class WorkspaceTests(unittest.TestCase):
         for dialog in self.service.state["dialogs"]:
             dialog["last_message_date"] = recent
         page = self.request("GET", "/")
-        self.assertNotIn("Проблемные чаты (", page)
+        self.assertNotIn("Неактивные (", page)
         self.assertIn("action=/problem-settings", page)
         self.assertIn("value='30'", page)
         self.assertIn("action=/switch-session", page)
@@ -245,17 +278,46 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("signal-add-alert", page)
 
         problem_chats.record_problem(self.service.state, "-300", title="Pending & group",
-                                     kind="group", reason="requested", message="Ожидает одобрения <админом>")
+                                     kind="group", reason="requested", message="Ожидает одобрения <админом>",
+                                     reference="https://t.me/+ValidInvite")
         page = self.request("GET", "/")
-        self.assertIn("Проблемные чаты (1)", page)
+        self.assertIn("Неактивные (1)", page)
         self.assertIn("class=\"page-tab problem-tab\"", page)
+        self.assertIn("<section data-page=problems hidden", page)
+        self.assertIn('href="https://t.me/+ValidInvite"', page)
         self.assertIn("Pending &amp; group", page)
         self.assertIn("Ожидает одобрения &lt;админом&gt;", page)
         self.assertIn("name=problem_chat value=\"-300\"", page)
         form = urlencode({"token": "test-token", "chat_id": "-300"})
         self.assertIn("303 See Other", self.request("POST", "/problem-resolve", form,
                                                     {"Origin": "http://127.0.0.1:8765"}))
-        self.assertNotIn("Проблемные чаты (", self.request("GET", "/"))
+        self.assertNotIn("Неактивные (", self.request("GET", "/"))
+
+    def test_inactive_without_pending_join_has_normal_tab(self):
+        self.service.state["dialogs"][0].update(history_known=True, last_message_date="")
+        self.service.state["dialogs"][1]["last_message_date"] = datetime.now(timezone.utc).isoformat()
+        page = self.request("GET", "/")
+        self.assertIn("Неактивные (1)", page)
+        self.assertNotIn('class="page-tab problem-tab"', page)
+
+    def test_training_and_codex_guide_have_author_links(self):
+        training = self.request("GET", "/training")
+        self.assertIn("Как пользоваться", training)
+        self.assertIn("https://t.me/ahdpeee", training)
+        self.assertIn("https://github.com/aHDpeee/messagesAutomation", training)
+        guide = self.request("GET", "/codex-guide")
+        self.assertIn("Анализ архивов с Codex", guide)
+        self.assertIn("href=\"/training\"", guide)
+        self.assertIn("<blockquote>", guide)
+        self.assertNotIn("<pre>", guide)
+
+    def test_guide_escapes_html_and_allows_safe_https_links(self):
+        from signal_archive.direct_app import _guide_html
+        rendered = _guide_html('# Heading\n\n<script>alert(1)</script> [help](https://example.org)\n\n> task')
+        self.assertIn('&lt;script&gt;', rendered)
+        self.assertNotIn('<script>', rendered)
+        self.assertIn('href="https://example.org"', rendered)
+        self.assertIn('<blockquote>task</blockquote>', rendered)
 
     def test_problem_settings_batch_scope_and_session_switch(self):
         from signal_archive import session as session_ops
@@ -294,11 +356,10 @@ class WorkspaceTests(unittest.TestCase):
         block = next(iter(self.service.state["blocks"]))
         self.assertIn("303", post("/block-assign", block=block, chat=["12", "-1001"]))
         self.assertIn("Friends &amp; family", self.request("GET", "/"))
-        self.assertIn("303", post("/select", block=block, selection=selection_fingerprint([])))
         self.assertEqual(set(self.service.state["selected"]), {"12", "-1001"})
         self.assertTrue((self.service.home / "chats.csv").is_file())
         self.assertIn("303", post("/block-delete", block=block))
-        self.assertEqual(set(self.service.state["selected"]), {"12", "-1001"})
+        self.assertEqual(self.service.state["selected"], [])
 
     def test_date_interval_and_add_chat_are_submitted(self):
         headers = {"Origin": "http://127.0.0.1:8765"}
@@ -366,14 +427,14 @@ class WorkspaceTests(unittest.TestCase):
     def test_chat_list_is_bounded_at_bottom_and_selection_controls_remain_available(self):
         self.service.state["dialogs"] = [{"id": "-1", "title": "Group", "type": "group", "accessible": True}]
         page = self.request("GET", "/")
-        self.assertLess(page.index("<h2>Latest activity</h2>"), page.index("<h2>Choose chats</h2>"))
+        self.assertLess(page.index("id=activity"), page.index("<h2>Чаты</h2>"))
         self.assertIn(".chat-list{max-height:", page)
         self.assertIn("overflow-y:auto", page)
         self.assertIn("class=chat-list tabindex=0", page)
         self.assertIn("name=chat value='-1'", page)
         self.assertIn("form=members name=chat_id value='-1'", page)
-        self.assertIn("action=/select", page)
-        self.assertIn("Save selection", page)
+        self.assertIn("class=group-membership", page)
+        self.assertNotIn("Select visible</button>", page)
 
     def test_only_group_checkbox_is_visible_and_export_selection_sorts_first(self):
         self.service.state["dialogs"] = [
@@ -399,7 +460,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("No public link", page)
         self.assertNotIn("domain=bad", page)
         self.assertIn("class=recent-list", page)
-        self.assertLess(page.index("Latest activity"), page.index("<h2>Export</h2>"))
+        self.assertLess(page.index("id=activity"), page.index("<h2>Экспорт</h2>"))
 
     def test_inaccessible_group_is_labeled_without_member_export_button(self):
         self.service.state["dialogs"] = [{"id": "-1", "title": "Old group", "type": "group", "accessible": False}]
@@ -457,7 +518,7 @@ class WorkspaceTests(unittest.TestCase):
         self.runtime.offline_legacy = True
         page = self.request("GET", "/")
         self.assertIn("Офлайн: старый архив", page)
-        self.assertIn("<section data-page=main hidden data-offline-disabled=yes><h2>Choose chats", page)
+        self.assertIn("<section class=chats-panel data-page=main hidden data-offline-disabled=yes><h2>Чаты", page)
         form = urlencode({"token": "test-token"})
         response = self.request("POST", "/refresh", form, {"Origin": "http://127.0.0.1:8765"})
         self.assertIn("400 Bad Request", response)
@@ -469,6 +530,35 @@ class WorkspaceTests(unittest.TestCase):
             response = self.request("POST", "/open-exports", form, {"Origin": "http://127.0.0.1:8765"})
             self.assertIn("303 See Other", response)
             opener.assert_called_once_with(self.service.exports)
+
+    def test_theme_accepts_color_persists_and_rejects_injection(self):
+        origin = {"Origin": "http://127.0.0.1:8765"}
+        body = urlencode({"token": "test-token", "accent": "#A1b2C3"})
+        self.assertIn("303 See Other", self.request("POST", "/theme", body, origin))
+        restored = DirectService(None, self.service.home, self.service.exports)
+        self.assertEqual(restored.state["accent_color"], "#a1b2c3")
+        self.assertIn("--accent:#a1b2c3", self.request("GET", "/"))
+        bad = urlencode({"token": "test-token", "accent": "#fff;}</style><script>alert(1)</script>"})
+        self.assertIn("400 Bad Request", self.request("POST", "/theme", bad, origin))
+        self.assertEqual(self.service.state["accent_color"], "#a1b2c3")
+        self.assertNotIn("<script>alert(1)</script>", self.request("GET", "/"))
+
+    def test_recent_export_is_in_status_and_path_opens_via_post(self):
+        self.service.state["last_export_messages"] = {"result": [{"chat_id": "1", "messages": 3, "path": "/tmp/archive.zip"}]}
+        page = self.request("GET", "/")
+        start = page.index("id=activity")
+        end = page.index("</details>", start)
+        self.assertIn("/tmp/archive.zip", page[start:end])
+        self.assertIn("action=/open-exports", page)
+        self.assertIn("class=path-link", page)
+
+    def test_status_returns_latest_export_after_page_load(self):
+        self.assertIn('"recent_exports": []', self.request("GET", "/status"))
+        self.service.state["last_export_messages"] = {"result": [{"chat_title": "<unsafe>", "messages": 2, "path": "/tmp/new.zip"}]}
+        response = self.request("GET", "/status")
+        self.assertIn('/tmp/new.zip', response)
+        self.assertIn('<unsafe>', response)  # JSON is data; the UI must use textContent.
+        self.assertIn('&lt;unsafe&gt;', self.request("GET", "/"))
 
     def test_session_lock_rejects_second_owner(self):
         path = Path(self.temp.name) / "lock"
