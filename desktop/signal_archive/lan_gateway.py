@@ -206,7 +206,7 @@ class LanGateway:
                     self.reply(400, '{"error":"Request failed or expired. Check approval and try again."}')
 
             def proxy(self, method):
-                if self.path not in ({"/", "/status", "/codex-guide", "/training"} if method == "GET" else {"/refresh", "/add-chat", "/export", "/interval", "/cancel", "/members", "/single-export", "/select", "/block-create", "/block-rename", "/block-delete", "/block-assign", "/group-membership", "/catalog-preview", "/catalog-edit", "/catalog-upload", "/catalog-reload", "/catalog-restore", "/telegram-folders-refresh", "/telegram-folder-preview", "/telegram-folder-import"}):
+                if self.path not in ({"/", "/status", "/codex-guide", "/training"} if method == "GET" else {"/refresh", "/add-chat", "/export", "/interval", "/cancel", "/members", "/members-batch", "/problem-resolve", "/single-export", "/select", "/block-create", "/block-rename", "/block-delete", "/block-assign", "/group-membership", "/catalog-preview", "/catalog-edit", "/catalog-upload", "/catalog-reload", "/catalog-restore", "/telegram-folders-refresh", "/telegram-folder-preview", "/telegram-folder-import"}):
                     self.reply(403, '{"error":"Available only on the host computer"}'); return
                 try:
                     body = self.body() if method == "POST" else None

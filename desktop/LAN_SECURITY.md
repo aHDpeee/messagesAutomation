@@ -1,37 +1,18 @@
-# Local-network access design (not enabled)
+# Доступ из локальной сети
 
-The current local interface binds to 127.0.0.1 and checks the Host and Origin
-headers. Do not change that binding to 0.0.0.0: the current local GET handler
-returns a shared form token and is not a remote authentication boundary.
+По умолчанию приложение доступно только на самом компьютере. В настройках можно отдельно включить экспериментальный HTTPS-доступ для телефона или другого устройства. Доступ выключается при закрытии приложения и требует повторного включения после запуска.
 
-A future opt-in network listener needs all of the following before it is enabled:
+## Подготовка
 
-1. A stable DNS hostname resolving to a private interface, with a trusted TLS
-   certificate for that hostname. Display explicit setup and certificate trust
-   instructions for each client. WebAuthn requires a secure context and a
-   valid relying-party domain; arbitrary LAN IPs must not be assumed to work.
-2. A separate listener and handler that require authentication for every
-   protected GET and POST, including status and file operations. Validate the
-   exact Host and HTTPS Origin. Retain separate local-only administration and
-   first-run login interfaces; never expose Telegram authorization to the LAN.
-3. A random, short-lived, single-use pairing request initiated from the phone
-   and explicitly approved in the local-only UI. Pairing approval and
-   credential registration must be linked to the same challenge; no password,
-   token or raw device address is a substitute for proof of possession.
-4. A maintained WebAuthn server implementation validating RP ID, exact origin,
-   challenge, authenticator signature, user verification and sign counter.
-   Store public keys, credential IDs and user-visible labels; never biometrics.
-   MAC addresses are not available to browser applications and are not a safe
-   identity mechanism. Bind and persist only completed registrations.
-5. Rotatable, short-lived, server-side authenticated sessions with Secure,
-   HttpOnly, SameSite cookies and CSRF protection, plus rate limits and a local
-   screen for revoking devices. Destroy sessions after revocation and restart.
-6. Security tests for unpaired, expired and revoked credentials, replayed
-   challenges, forged assertions, mismatched origins/RP IDs, proxy headers,
-   CSRF, concurrent pairing and sensitive endpoints. Verify real registration
-   and login with supported Windows, Linux and phone browser combinations.
+1. Установите приложение с зависимостью `webauthn` (обычный установщик устанавливает пакет с дополнительным компонентом LAN).
+2. Подготовьте постоянное доменное имя, которое на телефоне разрешается в частный IPv4-адрес компьютера, и HTTPS-сертификат с закрытым ключом для этого имени. Сертификату должен доверять браузер на телефоне. Один лишь локальный IP или неподтверждённый самоподписанный сертификат не гарантирует доступности passkey.
+3. Откройте Settings → «Доступ по локальной сети». Укажите частный IPv4-адрес компьютера, адрес вида `https://archive.example:8443` и пути к сертификату и ключу. Включите доступ.
+4. Откройте указанный HTTPS-адрес на телефоне, запросите сопряжение и сверьте код на телефоне и компьютере. Подтвердите запрос на компьютере, затем создайте passkey на телефоне и войдите с его помощью. Для повторного входа потребуется биометрия или PIN, поддерживаемый устройством.
 
-Only expose the network listener after these checks succeed. Do not weaken
-TLS, browser-origin or authenticator verification to make onboarding easier.
+Остановить доступ и отозвать ранее подключённые устройства можно на компьютере в том же разделе настроек. Приложение хранит публичный ключ passkey, а не биометрические данные. Браузер не предоставляет сайту MAC-адрес устройства, поэтому привязка к MAC не используется.
 
-Reference: https://www.w3.org/TR/webauthn/
+Шлюз требует отдельного защищённого входа, проверяет Origin и поддерживает только явно разрешённые действия; настройки сессии, открытие папок и управление подключёнными устройствами остаются на компьютере. Фильтрация частных IP сама по себе не гарантирует защиту от переадресации портов или VPN. Не публикуйте шлюз в интернет.
+
+Реальная работа с конкретным сертификатом, браузером и устройством ещё требует проверки. Не отключайте проверку TLS или passkey, если подключение не работает.
+
+Справка о требованиях WebAuthn: https://www.w3.org/TR/webauthn/

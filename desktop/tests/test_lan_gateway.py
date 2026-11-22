@@ -65,7 +65,7 @@ class GatewayTests(unittest.TestCase):
         from unittest.mock import MagicMock
         token = self.gateway.sessions.issue("device")
         cookie = "__Host-signal-session=" + token
-        routes = ("/catalog-preview", "/catalog-edit", "/catalog-upload", "/catalog-reload", "/catalog-restore")
+        routes = ("/catalog-preview", "/catalog-edit", "/catalog-upload", "/catalog-reload", "/catalog-restore", "/members-batch", "/problem-resolve")
         for path in routes:
             self.assertIn("403", self.request("POST", path, {}, origin=self.gateway.origin))
             self.assertIn("403", self.request("POST", path, {}, origin="https://evil.test", cookie=cookie))

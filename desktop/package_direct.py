@@ -16,7 +16,7 @@ FILES = (
     "signal_archive/direct_app.py", "signal_archive/direct_export.py", "signal_archive/telegram_folders.py",
     "signal_archive/direct_service.py", "signal_archive/telegram_ops.py", "signal_archive/legacy_archive.py", "signal_archive/catalog.py", "signal_archive/chat_add.py", "signal_archive/attribution.py", "signal_archive/problem_chats.py", "signal_archive/session.py", "signal_archive/schedule_timing.py",
     "signal_archive/export_notifications.py", "signal_archive/encrypted_bundle.py", "signal_archive/shortcuts.py", "signal_archive/shortcut_launcher.py", "signal_archive/browser_app.py",
-    "signal_archive/browser_login.py", "signal_archive/retention.py", "signal_archive/lan_gateway.py", "signal_archive/lan_pairing.py", "signal_archive/lan_sessions.py", "signal_archive/lan_tls.py", "signal_archive/lan_webauthn.py", "signal_archive/lan_device_store.py", "windows_entry.py", "SignalArchive.spec", "build-windows-exe.bat", "WINDOWS_BUILD.md", "CODEX_ARCHIVE_GUIDE.md",
+    "signal_archive/browser_login.py", "signal_archive/retention.py", "signal_archive/lan_gateway.py", "signal_archive/lan_pairing.py", "signal_archive/lan_sessions.py", "signal_archive/lan_tls.py", "signal_archive/lan_webauthn.py", "signal_archive/lan_device_store.py", "windows_entry.py", "SignalArchive.spec", "build-windows-exe.bat", "WINDOWS_BUILD.md", "CODEX_ARCHIVE_GUIDE.md", "LAN_SECURITY.md",
 )
 
 

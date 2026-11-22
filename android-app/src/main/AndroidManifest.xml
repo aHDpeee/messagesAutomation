@@ -1,16 +1,26 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:allowBackup="false"
-        android:label="Signal Archive"
-        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:label="Tegash"
+        android:theme="@style/AppTheme"
         android:supportsRtl="true">
-        <activity
-            android:name=".MainActivity"
-            android:exported="true">
+        <activity android:name=".CatalogActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <activity android:name=".TelegramActivity" android:exported="false" />
+        <activity android:name=".ExportActivity" android:exported="false" />
+        <activity android:name=".ScheduleActivity" android:exported="false" />
+        <activity android:name=".MembersExportActivity" android:exported="false" />
+        <activity android:name=".InactiveChatsActivity" android:exported="false" />
+        <activity android:name=".ShareExportActivity" android:exported="false" android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <provider android:name=".QrShareProvider" android:authorities="${applicationId}.qr" android:exported="false" android:grantUriPermissions="true" />
+        <service android:name=".ScheduledExportService" android:permission="android.permission.BIND_JOB_SERVICE" android:exported="true" />
+        <activity android:name=".NativeActivity" android:exported="false" />
     </application>
 </manifest>

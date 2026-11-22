@@ -237,8 +237,17 @@ class WorkspaceTests(unittest.TestCase):
         local = self.request("GET", "/")
         remote = self.request("GET", "/", headers={"X-Signal-Remote": "1"})
         self.assertIn("123456", local)
+        self.assertIn("Доступ по локальной сети", local)
         self.assertNotIn("123456", remote)
-        self.assertNotIn("LAN access and paired devices", remote)
+        self.assertNotIn("Доступ по локальной сети", remote)
+
+    def test_lan_guide_is_available_from_local_settings(self):
+        page = self.request("GET", "/")
+        self.assertIn("href='/lan-guide'", page)
+        guide = self.request("GET", "/lan-guide")
+        self.assertIn("200 OK", guide)
+        self.assertIn("Доступ из локальной сети", guide)
+        self.assertIn("passkey", guide)
 
     def test_shortcut_offer_is_remembered_and_settings_remain(self):
         self.assertIn('Add Signal Archive to your desktop', self.request('GET', '/'))

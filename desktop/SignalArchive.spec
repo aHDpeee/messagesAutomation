@@ -9,7 +9,7 @@ a = Analysis(
     ["windows_entry.py"],
     pathex=["."],
     binaries=keyring_binaries + telethon_binaries + webauthn_binaries,
-    datas=keyring_data + telethon_data + webauthn_data + [("CODEX_ARCHIVE_GUIDE.md", ".")],
+    datas=keyring_data + telethon_data + webauthn_data + [("CODEX_ARCHIVE_GUIDE.md", "."), ("LAN_SECURITY.md", ".")],
     hiddenimports=keyring_hidden + telethon_hidden + webauthn_hidden,
     hookspath=[],
     hooksconfig={},

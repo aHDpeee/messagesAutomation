@@ -1,6 +1,6 @@
-# Signal Archive
+# Tegash / Signal Archive
 
-Signal Archive is an experimental local-first Telegram export tool for Linux and Windows. It uses your Telegram account through Telethon to collect text and metadata from selected chats, channels and bots. It does not download media. The interface runs in your browser and writes exports to your computer.
+Tegash (formerly Signal Archive) is an experimental local-first Telegram export tool for Linux, Windows and Android. It uses your Telegram account through Telethon to collect text and metadata from selected chats, channels and bots. It does not download media. On desktop, the interface runs in your browser; Android has a native interface.
 
 The project is evolving. Ideas, bug reports, usability feedback and contributions are welcome. If something is confusing or does not work, please open an issue with your operating system, the steps you took and any error message. **Remove chat contents, phone numbers, API credentials, session files and other personal information before sharing logs or screenshots.**
 
@@ -30,7 +30,9 @@ A Secret Service keyring, such as GNOME Keyring or KDE Wallet, is required. For 
 
 Select and save chats in the browser interface before exporting. Exports normally go to `Downloads/Signal Archive`. Keep the application open while an export is running; use the Close button in the interface to exit the windowed executable.
 
-See [desktop setup and limitations](desktop/DIRECT_README.md) for existing sessions, schedules, recovery and removal of local credentials. The older Linux manager and Android companion are also present in this workspace; the direct desktop app uses its own session and state unless explicitly started with the old session.
+**Android (preview):** See the [Android guide](android-app/README.md) for QR login, device requirements, build and installation. The Android version is under active development and some workflows still need device testing; it does not yet have verified feature parity with desktop.
+
+See [desktop setup and limitations](desktop/DIRECT_README.md) for existing sessions, schedules, recovery and removal of local credentials. The older Linux manager is also present in this workspace; the direct desktop app uses its own session and state unless explicitly started with the old session.
 
 ## Development and contributions
 
@@ -43,6 +45,8 @@ SIGNAL_ARCHIVE_PYTHON="$PWD/desktop/.venv-direct/bin/python" sh ./desktop/verify
 Run `python desktop/package_direct.py` to create an allowlisted source ZIP. Building a Windows executable requires a Windows environment; see the build guide. Local tests cannot by themselves establish that Telegram authorization or a Windows desktop works on a particular machine.
 
 Ideas, fixes, documentation, translations and testing across platforms are all welcome. For a change, describe the problem and include relevant checks; never include personal Telegram data or credentials. See [desktop/LICENSE](desktop/LICENSE) for the current desktop license.
+
+Android development priorities and remaining checks are in the [finalization plan](ANDROID_FINALIZATION_PLAN.md). Feedback and contributions are welcome through the [GitHub repository](https://github.com/aHDpeee/messagesAutomation); contact the author on [Telegram](https://t.me/ahdpeee).
 
 Signal Archive is developed by ahdpeee with help from Codex.
 
