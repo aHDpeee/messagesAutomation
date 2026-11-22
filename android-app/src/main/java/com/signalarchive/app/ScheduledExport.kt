@@ -149,7 +149,8 @@ class ScheduledExportService : JobService() {
                     check(ArchiveRetention.record(applicationContext, tree, completedUri, end, expectedSize, sha256)) { "ZIP сохранён, но не удалось сохранить журнал архивов" }
                     check(ExportCheckpoint.advanceChats(applicationContext, ids, key, start, end)) { "ZIP сохранён, но не удалось сохранить время экспорта" }
                     if (prefs.getBoolean("email_enabled", false)) {
-                        try { MailSettings.send(applicationContext, temporary, finalName) }
+                        val mailRetention = if (prefs.getBoolean("retention_enabled", false)) prefs.getInt("retention_days", 30) else 0
+                        try { MailSettings.send(applicationContext, temporary, finalName, mailRetention) }
                         catch (_: Exception) { mailFailed = true }
                     }
                   } finally { IntermediateExports.remove(intermediates); intermediates.clear(); ExportProgress.finish(progressId); ExportNotifications.clear(applicationContext, 0x534165) }

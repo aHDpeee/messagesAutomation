@@ -14,11 +14,15 @@ class MailSenderTests(unittest.TestCase):
             client = MagicMock()
             with patch("tg_observatory.mail_sender.smtplib.SMTP") as smtp:
                 smtp.return_value.__enter__.return_value = client
-                send("smtp.example.com", 587, "from@example.com", "secret", "to@example.com", str(path), "archive.zip")
+                send("smtp.example.com", 587, "from@example.com", "secret", "to@example.com", str(path), "archive.zip", 30)
             client.starttls.assert_called_once()
             client.login.assert_called_once_with("from@example.com", "secret")
             message = client.send_message.call_args.args[0]
             self.assertEqual(message["To"], "to@example.com")
+            self.assertIn("[Tegash Archive]", str(message["Subject"]))
+            self.assertEqual(message["X-Tegash-Archive"], "scheduled-export")
+            self.assertEqual(message["X-Tegash-Retention-Days"], "30")
+            self.assertIsNotNone(message["Expires"])
             self.assertEqual(next(message.iter_attachments()).get_payload(decode=True), b"archive")
 
     def test_invalid_port_never_connects(self):

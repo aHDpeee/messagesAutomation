@@ -19,6 +19,7 @@ class MailSettingsActivity : BackSwipeActivity() {
         val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 24, 32, 24) }
         body.addView(TextView(this).apply { text = "Отправка на почту"; textSize = 24f })
         body.addView(TextView(this).apply { text = "Архивы содержат личную переписку. Автоматическая отправка выполняется только после включения. Используйте пароль приложения почтового сервиса. Поддерживается SMTP с TLS: порт 465 или 587; архив до 20 МиБ." })
+        body.addView(TextView(this).apply { text = "Фильтр в почте: тема содержит [Tegash Archive]. При включённом сроке хранения письмо также получает заголовок Expires, но почтовые сервисы не обязаны удалять его автоматически. Настройте удаление по сроку в самой почте, если сервис поддерживает такие правила." })
         fun field(label: String, key: String, secret: Boolean = false): EditText = EditText(this).apply {
             hint = label; setSingleLine(); setText(previous?.optString(key, "").orEmpty())
             if (secret) inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD

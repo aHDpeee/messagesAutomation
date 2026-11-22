@@ -3,9 +3,11 @@ from email.message import EmailMessage
 from pathlib import Path
 import smtplib
 import ssl
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 
-def send(host: str, port: int, username: str, password: str, recipient: str, path: str, filename: str) -> None:
+def send(host: str, port: int, username: str, password: str, recipient: str, path: str, filename: str, retention_days: int = 0) -> None:
     if not host or port not in (465, 587) or not username or not password or not recipient:
         raise ValueError("SMTP configuration is incomplete")
     if any("\n" in value or "\r" in value for value in (host, username, recipient, filename)):
@@ -16,8 +18,13 @@ def send(host: str, port: int, username: str, password: str, recipient: str, pat
     message = EmailMessage()
     message["From"] = username
     message["To"] = recipient
-    message["Subject"] = "Tegash: архив сообщений"
-    message.set_content("Во вложении — архив Tegash, отправленный по вашему расписанию.")
+    message["Subject"] = "[Tegash Archive] Автоматический архив сообщений"
+    message["X-Tegash-Archive"] = "scheduled-export"
+    message["Date"] = format_datetime(datetime.now(timezone.utc))
+    if 1 <= retention_days <= 36500:
+        message["X-Tegash-Retention-Days"] = str(retention_days)
+        message["Expires"] = format_datetime(datetime.now(timezone.utc) + timedelta(days=retention_days))
+    message.set_content("Во вложении — архив Tegash, отправленный по вашему расписанию.\n\nМетка для почтового фильтра: [Tegash Archive].")
     message.add_attachment(attachment.read_bytes(), maintype="application", subtype="zip", filename=filename)
     context = ssl.create_default_context()
     if port == 465:
