@@ -13,8 +13,8 @@ from tg_observatory.exceptions import AuthenticationRequired, InvalidRequest, Me
 from tg_observatory.services.account_service import credentials_from
 from tg_observatory.services.participant_service import _positive_or_signed_id
 
-FIELDS = ("record_type", "user_id", "username", "first_name", "last_name", "phone", "bio",
-          "personal_channel_id", "personal_channel_title", "personal_channel_username", "is_bot",
+FIELDS = ("record_type", "user_id", "username", "first_name", "last_name", "phone", "bio", "bio_status",
+          "personal_channel_id", "personal_channel_title", "personal_channel_username", "personal_channel_link", "personal_channel_status", "is_bot",
           "is_premium", "group_role", "note", "source_group_id", "source_group_title", "block group / plan")
 
 
@@ -103,10 +103,15 @@ async def export_csv(gateway: Any, database: Any, accounts: Any, directory: Path
                                                     ("bio", "bio"), ("bot", "is_bot"), ("premium", "is_premium")):
                             row[destination] = _text(_value(fields, source))
                         channel = _value(fields, "personal_channel")
+                        row["bio_status"] = fields.get("bio", {}).get("state", "NOT_FETCHED")
+                        row["personal_channel_status"] = fields.get("personal_channel", {}).get("state", "NOT_FETCHED")
                         if isinstance(channel, dict):
                             row["personal_channel_id"] = _text(channel.get("telegram_channel_id"))
                             row["personal_channel_title"] = _text(channel.get("title"))
                             row["personal_channel_username"] = _text(channel.get("username"))
+                            username = channel.get("username")
+                            if isinstance(username, str) and username.isascii() and username.replace("_", "").isalnum():
+                                row["personal_channel_link"] = f"https://t.me/{username}"
                         writer.writerow(row)
                         count += 1
                         if count % 100 == 0:

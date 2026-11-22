@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import webbrowser
+import urllib.request
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +23,31 @@ from .direct_service import DirectService, _write_state, selection_fingerprint
 from . import autostart, legacy_archive, catalog, problem_chats, session as session_ops
 
 SERVICE = "SignalArchiveDirect"
+DESKTOP_VERSION = (0, 3, 6)
+
+
+def _check_desktop_release() -> str | None:
+    """Return a verified release tag, never a download URL from an API response."""
+    request = urllib.request.Request("https://api.github.com/repos/aHDpeee/messagesAutomation/releases?per_page=20", headers={"User-Agent": "Tegash-Desktop", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        payload = response.read(1_000_001)
+    if len(payload) > 1_000_000:
+        raise ValueError("Release response too large")
+    releases = json.loads(payload)
+    candidates = []
+    for release in releases:
+        if release.get("draft") or release.get("prerelease"):
+            continue
+        tag = release.get("tag_name", "")
+        match = re.fullmatch(r"desktop-v(\d+)\.(\d+)\.(\d+)", tag)
+        if not match:
+            continue
+        assets = [str(asset.get("name", "")).lower() for asset in release.get("assets", [])]
+        suffix = ".exe" if os.name == "nt" else ".zip"
+        version = tuple(map(int, match.groups()))
+        if version > DESKTOP_VERSION and any(name.endswith(suffix) for name in assets):
+            candidates.append((version, tag))
+    return max(candidates)[1] if candidates else None
 
 
 def _recent_export_lines(state: dict) -> list[str]:
@@ -283,6 +309,14 @@ function updateScheduleSummary() {
 }
 function update() {
     fetch('/status').then(r => r.json()).then(s => {
+        if (s.available_release) {
+            const key = 'tegash-release-' + s.available_release;
+            if (!sessionStorage.getItem(key)) {
+                sessionStorage.setItem(key, 'shown');
+                if (confirm('Доступно обновление ' + s.available_release + '. Открыть страницу загрузки?'))
+                    window.open('https://github.com/aHDpeee/messagesAutomation/releases/tag/' + encodeURIComponent(s.available_release), '_blank', 'noopener,noreferrer');
+            }
+        }
         scheduleTiming = s.schedule_timing || {};
         updateScheduleSummary();
         updateRecentExports(s.recent_exports);
@@ -499,6 +533,13 @@ class Runtime:
         self.scheduled_cancel_requested = False
         self.guard = threading.Lock()
         self.lan_gateway = None
+        self.available_release = None
+
+    def check_release(self):
+        try:
+            self.available_release = _check_desktop_release()
+        except (OSError, ValueError, TypeError, AttributeError):
+            self.available_release = None
 
     def start_lan(self, origin, certificate, private_key, local_port, bind_ip):
         from .lan_gateway import LanGateway
@@ -649,6 +690,7 @@ def make_handler(runtime: Runtime, token: str):
             if self.path == "/status":
                 from .schedule_timing import summary as schedule_summary
                 state = runtime.call(lambda: {"job": json.loads(json.dumps(runtime.service.state.get("job", {}))), "schedule_timing": schedule_summary(runtime.service.state), "recent_exports": _recent_export_lines(runtime.service.state)})
+                state["available_release"] = getattr(runtime, "available_release", None)
                 self.send(json.dumps(state, ensure_ascii=False), content_type="application/json; charset=utf-8"); return
             if self.path != "/":
                 self.send("Not found", 404); return
@@ -1311,6 +1353,7 @@ def _run(home: Path, exports: Path, port: int = 8765, *, open_browser: bool = Tr
                     raise RuntimeError("Telegram did not return the authorized account. Please sign in again.")
                 service.bind_account(account.id)
             runtime = Runtime(loop, service, external_session=session_file is not None, offline_legacy=offline_legacy)
+            threading.Thread(target=runtime.check_release, daemon=True).start()
             from .shortcuts import ensure_application_shortcut
             ensure_application_shortcut(home, exports, session_file is not None)
             server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(runtime, secrets.token_urlsafe(32)))

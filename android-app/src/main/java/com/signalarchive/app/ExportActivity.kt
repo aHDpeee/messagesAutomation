@@ -2,6 +2,7 @@ package com.signalarchive.app
 
 import android.app.Activity
 import android.app.DatePickerDialog
+import android.app.TimePickerDialog
 import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
@@ -19,12 +20,13 @@ import org.json.JSONObject
 import java.io.File
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
 
 /** Explicit user-started export of selected Telegram chats into a single ZIP. */
-class ExportActivity : Activity() {
+class ExportActivity : BackSwipeActivity() {
     private val worker = Executors.newSingleThreadExecutor()
     private lateinit var status: TextView
     private lateinit var progress: ProgressBar
@@ -42,13 +44,16 @@ class ExportActivity : Activity() {
     private var pendingStart: String = ""
     private var pendingIds: List<String> = emptyList()
     private var pendingAccountId: String = ""
+    private var pendingNameBase: String = ""
     private var working = false
     private var saving = false
     private var automaticStart: Instant? = null
     private val singleChatId: String? by lazy { intent.getStringExtra("chat_id") }
+    private val blockName: String? by lazy { intent.getStringExtra("block_name") }
     private fun exportRows(): List<MutableMap<String, String>> {
         val rows = ChatCatalog(File(filesDir, "chats.csv")).load()
-        return if (singleChatId == null) rows.filter { !it["blocks"].isNullOrBlank() }
+        return if (blockName != null) rows.filter { it["blocks"].orEmpty().equals(blockName, true) }
+        else if (singleChatId == null) rows.filter { !it["blocks"].isNullOrBlank() }
         else rows.filter { it["id"] == singleChatId }
     }
     @Volatile private var destroyed = false
@@ -60,13 +65,13 @@ class ExportActivity : Activity() {
         super.onCreate(savedInstanceState)
         val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(28), dp(20), dp(20)); setBackgroundColor(Color.rgb(17,19,21)) }
         fun label(value: String, size: Float = 14f) = TextView(this).apply { text = value; textSize = size; setTextColor(Color.WHITE) }
-        page.addView(label(if (singleChatId == null) "Экспорт Telegram" else "Экспорт одного чата", 26f))
+        page.addView(label(if (blockName != null) "Экспорт блока $blockName" else if (singleChatId == null) "Экспорт Telegram" else "Экспорт одного чата", 26f))
         status = label("Период указан в местном часовом поясе. Медиа не скачиваются."); page.addView(status)
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { visibility = View.GONE }
         page.addView(progress, LinearLayout.LayoutParams(-1, dp(12)))
         page.addView(label(if (singleChatId == null) "Сначала войдите в Telegram и обновите чаты. Выберите их группы в каталоге." else "Чат без группы будет сохранён в корне архива."))
-        start = EditText(this).apply { hint = "Начальная дата YYYY-MM-DD"; setSingleLine(); setTextColor(Color.WHITE); setHintTextColor(Color.LTGRAY) }
-        end = EditText(this).apply { hint = "Конечная дата YYYY-MM-DD (включительно)"; setSingleLine(); setTextColor(Color.WHITE); setHintTextColor(Color.LTGRAY) }
+        start = EditText(this).apply { hint = "С: ГГГГ-ММ-ДД ЧЧ:ММ"; setSingleLine(); setTextColor(Color.WHITE); setHintTextColor(Color.LTGRAY) }
+        end = EditText(this).apply { hint = "По: ГГГГ-ММ-ДД ЧЧ:ММ"; setSingleLine(); setTextColor(Color.WHITE); setHintTextColor(Color.LTGRAY) }
         val today = LocalDate.now()
         val priorInstant = runCatching {
             val chats = exportRows()
@@ -79,7 +84,8 @@ class ExportActivity : Activity() {
         val rememberedStart = if (remember) periodSettings.getString("$singleChatId:start", null) else null
         val rememberedEnd = if (remember) periodSettings.getString("$singleChatId:end", null) else null
         automaticStart = if (remember || full) null else priorInstant
-        start.setText(if (full) "1970-01-02" else rememberedStart ?: (priorInstant?.atZone(ZoneId.systemDefault())?.toLocalDate() ?: today.minusDays(1)).toString()); end.setText(rememberedEnd ?: today.toString())
+        val dateTimeFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+        start.setText(if (full) "1970-01-02 00:00" else rememberedStart ?: (priorInstant?.atZone(ZoneId.systemDefault())?.toLocalDateTime() ?: LocalDateTime.now().minusDays(1)).format(dateTimeFormat)); end.setText(rememberedEnd ?: LocalDateTime.now().format(dateTimeFormat))
         // An explicitly edited start date means the beginning of that day,
         // even when it is the same day as the automatic checkpoint.
         start.addTextChangedListener(object : TextWatcher {
@@ -93,22 +99,28 @@ class ExportActivity : Activity() {
             line.addView(Button(this).apply {
                 text = caption
                 setOnClickListener {
-                    val date = runCatching { LocalDate.parse(field.text.toString().trim()) }.getOrDefault(LocalDate.now())
+                    val existing = runCatching { LocalDateTime.parse(field.text.toString().trim(), dateTimeFormat) }.getOrDefault(LocalDateTime.now())
+                    val date = existing.toLocalDate()
                     DatePickerDialog(this@ExportActivity, { _, year, month, day ->
-                        if (field === start) automaticStart = null
-                        field.setText(LocalDate.of(year, month + 1, day).toString())
+                        TimePickerDialog(this@ExportActivity, { _, hour, minute ->
+                            if (field === start) automaticStart = null
+                            field.setText(LocalDateTime.of(year, month + 1, day, hour, minute).format(dateTimeFormat))
+                        }, existing.hour, existing.minute, true).show()
                     }, date.year, date.monthValue - 1, date.dayOfMonth).show()
                 }
             })
             page.addView(line)
         }
-        addDate(start, "С даты"); addDate(end, "По дату")
+        addDate(start, "Дата и время"); addDate(end, "Дата и время")
         if (singleChatId != null) {
             rememberPeriod = CheckBox(this).apply { text = "Запомнить этот период для чата"; setTextColor(Color.WHITE); isChecked = remember }
             page.addView(rememberPeriod)
         }
         startButton = Button(this).apply { text = "Получить сообщения и собрать ZIP"; setOnClickListener { begin() } }; page.addView(startButton)
         cancelButton = Button(this).apply { text = "Остановить экспорт"; isEnabled = false; setOnClickListener { cancelRequested = true; exportThread?.interrupt(); isEnabled = false; status.text = "Останавливаем экспорт…" } }; page.addView(cancelButton)
+        page.addView(Button(this).apply { text = "К списку чатов"; setOnClickListener {
+            startActivity(Intent(this@ExportActivity, CatalogActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
+        } })
         saveButton = Button(this).apply { text = "Сохранить ZIP"; isEnabled = false; setOnClickListener { saveZip() } }; page.addView(saveButton)
         setContentView(ScrollView(this).apply { addView(page) })
         SystemInsets.apply(this, findViewById<android.view.ViewGroup>(android.R.id.content).getChildAt(0))
@@ -124,6 +136,7 @@ class ExportActivity : Activity() {
             if (file?.isFile == true && ids != null && !from.isNullOrBlank() && !until.isNullOrBlank() && !key.isNullOrBlank()) {
                 pending = file; pendingIds = ids; pendingStart = from; pendingEnd = until; selectionKey = key
                 pendingAccountId = saved.getString("account_id", "")
+                pendingNameBase = saved.getString("name_base", "")
                 saveButton.isEnabled = true; status.text = if (saved.getBoolean("saving")) "Сохранение могло прерваться. Проверьте файл или сохраните архив повторно." else "Архив готов. Выберите место сохранения."
             } else if (saved.getBoolean("working")) status.text = "Экспорт был прерван при изменении экрана. Запустите его снова."
         }
@@ -132,20 +145,24 @@ class ExportActivity : Activity() {
 
     private fun begin() {
         try {
-            val first = LocalDate.parse(start.text.toString().trim())
-            val last = LocalDate.parse(end.text.toString().trim())
-            require(!last.isBefore(first)) { "Конечная дата раньше начальной" }
+            val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+            fun parse(text: String, endOfDay: Boolean): LocalDateTime = runCatching { LocalDateTime.parse(text.trim(), formatter) }.getOrElse {
+                val date = LocalDate.parse(text.trim()); if (endOfDay) date.atTime(23, 59) else date.atStartOfDay()
+            }
+            val first = parse(start.text.toString(), false)
+            val last = parse(end.text.toString(), true)
+            require(!last.isBefore(first)) { "Конец периода раньше начала" }
             val zone = ZoneId.systemDefault()
             val now = Instant.now()
-            val from = ExportRange.start(first, zone, automaticStart, now)
-            val exclusiveEnd = minOf(last.plusDays(1).atStartOfDay(zone).toInstant(), now)
+            val from = automaticStart?.takeIf { it < now && it.atZone(zone).toLocalDateTime().withSecond(0).withNano(0) == first } ?: first.atZone(zone).toInstant()
+            val exclusiveEnd = minOf(last.plusMinutes(1).atZone(zone).toInstant(), now)
             require(from < exclusiveEnd) { "Период ещё не начался" }
             val chats = exportRows().map { GroupedArchive.Chat(it["id"].orEmpty(), it["title"].orEmpty(), it["blocks"].orEmpty().ifBlank { "Ungrouped" }, it["username"].orEmpty(), it["type"].orEmpty()) }
             require(chats.isNotEmpty()) { if (singleChatId == null) "Сначала назначьте группы чатам в каталоге" else "Чат больше не найден в каталоге" }
             val credential = SecureCredentialStore(this).load() ?: throw IllegalStateException("Сначала войдите в Telegram")
             singleChatId?.takeUnless { intent.getBooleanExtra("full", false) }?.let { id ->
                 val editor = getSharedPreferences("single_chat_period", MODE_PRIVATE).edit().putBoolean("$id:remember", rememberPeriod?.isChecked == true)
-                if (rememberPeriod?.isChecked == true) editor.putString("$id:start", first.toString()).putString("$id:end", last.toString())
+                if (rememberPeriod?.isChecked == true) editor.putString("$id:start", first.format(formatter)).putString("$id:end", last.format(formatter))
                 else editor.remove("$id:start").remove("$id:end")
                 check(editor.commit()) { "Не удалось сохранить настройки периода" }
             }
@@ -177,12 +194,14 @@ class ExportActivity : Activity() {
                             .put("expected_account_id", accountId)
                             .put("period_start", from.toString()).put("period_end", exclusiveEnd.toString())
                         try {
-                            val result = TelegramBridge.runJob(applicationContext, "messages.export", params, allowPartial = true)
+                            val result = TelegramBridge.runExportWithRetry(applicationContext, "messages.export", params) { note ->
+                                if (note.startsWith("Пауза Telegram")) ui { status.text = note }
+                            }
                             IntermediateExports.checked(filesDir, result.getString("file_path")).also(intermediates::add)
                         } catch (e: TelegramJobException) {
                             if (e.code == "empty_message_range") null else throw e
                         }
-                    }, allowEmpty = true) { index, total, title ->
+                    }, allowEmpty = true, prompts = BlockPrompts.forChats(applicationContext, accountId, chats)) { index, total, title ->
                         ExportProgress.update(progressId, total - index)
                         ExportNotifications.progress(applicationContext, 0x534163, "Осталось чатов: ${total - index}", index, total)
                         ui { progress.isIndeterminate = false; progress.progress = index; status.text = "Осталось чатов: ${total - index}" }
@@ -205,7 +224,11 @@ class ExportActivity : Activity() {
                             status.text = if (emptyCheckpointSaved) "За выбранный период новых сообщений не найдено." else "Новых сообщений нет, но не удалось сохранить дату проверки; проверьте период в следующий раз."
                             ExportNotifications.completed(applicationContext, if (emptyCheckpointSaved) "Новых сообщений нет" else "Проверьте дату следующего экспорта", 0x534153)
                         }
-                        else { pending = file; selectionKey = fingerprint; pendingStart = from.toString(); pendingEnd = exclusiveEnd.toString(); pendingIds = chats.map { it.id }; pendingAccountId = exportedAccountId; saveButton.isEnabled = true; status.text = "Готово: ${result.chats} чатов, ${result.messages} сообщений. Telegram может ограничивать доступную историю. Выберите место сохранения." }
+                        else { pending = file; selectionKey = fingerprint; pendingStart = from.toString(); pendingEnd = exclusiveEnd.toString(); pendingIds = chats.map { it.id }; pendingAccountId = exportedAccountId; pendingNameBase = ArchiveNames.base(chats.map { it.group }, from, exclusiveEnd); saveButton.isEnabled = true; status.text = "Готово: ${result.chats} чатов, ${result.messages} сообщений. Telegram может ограничивать доступную историю. Выберите место сохранения." }
+                    }
+                    if (result.chats > 0 && !cancelRequested) runCatching {
+                        val uri = ExportNotifications.keepForSharing(applicationContext, file)
+                        ExportNotifications.completed(applicationContext, "Архив готов · нажмите, чтобы поделиться", 0x534153, uri)
                     }
                 } catch (e: Exception) {
                     file.delete(); ui { working = false; cancelButton.isEnabled = false; startButton.isEnabled = true; progress.visibility = View.GONE; status.text = if (cancelRequested) "Экспорт отменён" else "Экспорт не завершён: ${e.message ?: e.javaClass.simpleName}" }
@@ -219,12 +242,12 @@ class ExportActivity : Activity() {
         outState.putBoolean("saving", saving)
         outState.putString("automatic_start", automaticStart?.toString())
         rememberPeriod?.let { outState.putBoolean("remember", it.isChecked) }
-        pending?.let { outState.putString("pending", it.name); outState.putString("key", selectionKey); outState.putString("from", pendingStart); outState.putString("until", pendingEnd); outState.putString("account_id", pendingAccountId); outState.putStringArrayList("ids", ArrayList(pendingIds)) }
+        pending?.let { outState.putString("pending", it.name); outState.putString("key", selectionKey); outState.putString("from", pendingStart); outState.putString("until", pendingEnd); outState.putString("account_id", pendingAccountId); outState.putString("name_base", pendingNameBase); outState.putStringArrayList("ids", ArrayList(pendingIds)) }
     }
     private fun saveZip() {
         if (pending == null) return
         startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
-            .setType("application/zip").putExtra(Intent.EXTRA_TITLE, "Telegram_${LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE)}.zip"), 301)
+            .setType("application/zip").putExtra(Intent.EXTRA_TITLE, ArchiveNames.reserve(this, pendingNameBase.ifBlank { "Tegash_export" })), 301)
     }
     @Deprecated("Document picker on supported Android versions")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

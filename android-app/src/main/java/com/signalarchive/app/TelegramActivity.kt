@@ -25,7 +25,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /** Explicit, user-initiated Telegram authorization and dialog discovery. */
-class TelegramActivity : Activity() {
+class TelegramActivity : BackSwipeActivity() {
     private val worker = Executors.newSingleThreadExecutor()
     private lateinit var credentials: SecureCredentialStore
     private lateinit var id: EditText
@@ -44,6 +44,7 @@ class TelegramActivity : Activity() {
     private lateinit var nextButton: Button
     private lateinit var backButton: Button
     private lateinit var qrButton: Button
+    private lateinit var passwordFallbackButton: Button
     private lateinit var checkButton: Button
     private lateinit var restoreButton: Button
     private var autoAddPending = false
@@ -66,6 +67,7 @@ class TelegramActivity : Activity() {
         signedInViews.forEach { it.visibility = if (state == LoginState.SIGNED_IN) View.VISIBLE else View.GONE }
         passwordViews.forEach { it.visibility = if (state == LoginState.PASSWORD) View.VISIBLE else View.GONE }
         qrButton.visibility = if ((state == LoginState.SIGNED_OUT && setupStep == 1) || state == LoginState.PASSWORD) View.VISIBLE else View.GONE
+        passwordFallbackButton.visibility = if ((state == LoginState.SIGNED_OUT && setupStep == 1) || state == LoginState.PASSWORD) View.VISIBLE else View.GONE
         nextButton.visibility = if (state == LoginState.SIGNED_OUT && setupStep == 0) View.VISIBLE else View.GONE
         backButton.visibility = if (state == LoginState.SIGNED_OUT && setupStep == 1) View.VISIBLE else View.GONE
         checkButton.visibility = if (state == LoginState.UNKNOWN) View.VISIBLE else View.GONE
@@ -99,7 +101,8 @@ class TelegramActivity : Activity() {
         update(label)
         worker.execute {
             try { action() } catch (error: Exception) {
-                val message = if (error is InterruptedException) "Операция отменена." else error.message ?: "Операция не выполнена"
+                if (error is TelegramJobException && error.code == "password_required") showState(LoginState.PASSWORD)
+                val message = if ((error is TelegramJobException && error.code == "password_required") || (error is InterruptedException && passwordPending)) "Введите пароль двухэтапной проверки Telegram." else if (error is InterruptedException) "Операция отменена." else error.message ?: "Операция не выполнена"
                 update(message)
                 if (intent.getBooleanExtra("auto_add", false)) runOnUiThread { if (alive) android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show() }
             }
@@ -181,9 +184,10 @@ class TelegramActivity : Activity() {
                         if (alive) {
                             window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
                             qrDialog = AlertDialog.Builder(this).setTitle("Вход через Telegram")
-                                .setMessage("Отправьте QR себе и откройте на другом экране, затем в Telegram выберите Настройки → Устройства → Подключить устройство. QR даёт доступ к аккаунту и быстро истекает: никому другому его не отправляйте.")
+                                .setMessage("Сразу отправьте QR себе и откройте на другом экране. В Telegram выберите Настройки → Устройства → Подключить устройство. Код действует недолго и даёт доступ к аккаунту — никому другому его не отправляйте. Если Telegram запросил пароль, выберите «Ввести пароль 2FA».")
                                 .setView(ImageView(this).apply { setImageBitmap(bitmap); adjustViewBounds = true })
                                 .setNeutralButton("Поделиться QR") { _, _ -> }
+                                .setPositiveButton("Ввести пароль 2FA") { _, _ -> showState(LoginState.PASSWORD); password.requestFocus() }
                                 .setNegativeButton("Отмена", null).create().apply {
                                     setOnDismissListener { this@TelegramActivity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE); qrWaitThread?.interrupt() }
                                     show()
@@ -207,7 +211,7 @@ class TelegramActivity : Activity() {
                     update(when (finished.optString("status")) {
                         "authenticated" -> { showState(LoginState.SIGNED_IN); "Telegram подключён. Обновите список чатов." }
                         "password_required" -> { showState(LoginState.PASSWORD); "Введите пароль двухэтапной проверки и нажмите «Подтвердить пароль»." }
-                        "expired" -> { showState(LoginState.SIGNED_OUT); "Срок действия QR-кода истёк. Создайте новый код." }
+                        "expired" -> { showState(LoginState.SIGNED_OUT); "Telegram больше не принимает этот QR. Создайте новый и отправьте его на второй экран сразу. Если Telegram запросил пароль, нажмите «Ввести пароль 2FA»." }
                         else -> "Не удалось завершить вход."
                     })
                 } finally {
@@ -217,6 +221,11 @@ class TelegramActivity : Activity() {
                 }
             }
         }; body.addView(qrButton)
+        passwordFallbackButton = button("Ввести пароль 2FA") {
+            showState(LoginState.PASSWORD)
+            update("Введите пароль двухэтапной проверки Telegram, если он был запрошен после сканирования QR.")
+            password.requestFocus()
+        }; body.addView(passwordFallbackButton)
         val switchButton = button("Сменить аккаунт") {
             AlertDialog.Builder(this).setTitle("Сменить аккаунт Telegram?")
                 .setMessage("Текущая сессия и база будут сохранены отдельно, каталог — в резервной копии. Расписание отключится; для нового аккаунта потребуется вход и новый список чатов. Сохранённые ZIP не удаляются.")
@@ -333,6 +342,10 @@ class TelegramActivity : Activity() {
                     check(binding.edit().putString("telegram_id", accountId).commit()) { "Не удалось сохранить привязку каталога к аккаунту." }
                 }
                 val sync = TelegramBridge.runJob(this, "dialogs.sync", p) { if (it.isNotBlank()) update(it) }
+                val syncedArray = sync.optJSONArray("synced_ids") ?: org.json.JSONArray()
+                val liveIds = (0 until syncedArray.length()).map { syncedArray.optString(it) }.toSet()
+                val removedPrefs = getSharedPreferences("removed_dialogs", MODE_PRIVATE)
+                val removed = removedPrefs.getStringSet(accountId, emptySet()).orEmpty().toSet() - liveIds
                 val byId = rows.associateBy { it["id"].orEmpty() }.toMutableMap()
                 var offset = 0
                 do {
@@ -340,8 +353,9 @@ class TelegramActivity : Activity() {
                     val items = result.getJSONArray("items")
                     for (i in 0 until items.length()) {
                         val dialog = items.getJSONObject(i); val ident = dialog.getString("telegram_id")
+                        if (ident in removed) continue
                         val row = byId.getOrPut(ident) { ChatCatalog.columns.associateWith { "" }.toMutableMap().also(rows::add) }
-                        row["id"] = ident; row["title"] = dialog.optString("title", ident)
+                        row["id"] = ident; row["title"] = DialogTitle.choose(dialog.optString("title", ""), row["title"], dialog.optString("username", ""), ident)
                         row["type"] = when (dialog.optString("kind")) { "private" -> "chat"; "group" -> "group"; "channel" -> "channel"; "bot" -> "bot"; else -> "chat" }
                         val username = dialog.optString("username", "").let { if (it == "null") "" else it }
                         row["link"] = TelegramLink.refreshed(row["username"].orEmpty(), row["link"].orEmpty(), username)
@@ -389,6 +403,7 @@ class TelegramActivity : Activity() {
                     catalog.save(rows, expectedVersion = catalogVersion)
                     approvedKeys.forEach { PendingRequests.remove(applicationContext, it) }
                 }
+                removedPrefs.edit().putStringSet(accountId, removed).apply()
                 update("Обновлено чатов: ${rows.size}. Откройте каталог для выбора групп.")
             }
         }; body.addView(syncButton); signedInViews.add(syncButton)

@@ -33,8 +33,10 @@ import java.util.concurrent.Executors
 import org.json.JSONObject
 
 /** Locally managed chat catalog; Telegram synchronization is provided separately. */
-class CatalogActivity : Activity() {
+class CatalogActivity : BackSwipeActivity() {
+    override val emptySpaceBackSwipeEnabled = false
     private val inactiveTab = "\u0000inactive"
+    private val allTab = "\u0000all"
     private val worker = Executors.newSingleThreadExecutor()
     @Volatile private var alive = true
     private lateinit var db: ArchiveDb
@@ -62,14 +64,16 @@ class CatalogActivity : Activity() {
             val row = getItem(position)
             val pending = row["type"] == "pending"
             val group = row["blocks"].orEmpty()
-            checkbox.visibility = if (selectedGroup == inactiveTab) View.GONE else View.VISIBLE
+            checkbox.visibility = if (selectedGroup == allTab && !pending) View.VISIBLE else View.GONE
             val availability = getSharedPreferences("dialog_availability", MODE_PRIVATE)
             val account = getSharedPreferences("catalog_account", MODE_PRIVATE).getString("telegram_id", null)
             val snapshot = if (account != null && availability.getString("account_id", null) == account) availability.getStringSet("ids", null) else null
             val note = if (!pending && DialogAvailability.unavailable(row["id"].orEmpty(), snapshot)) " · недоступен при обновлении" else ""
             val username = row["username"].orEmpty().removePrefix("@").takeIf { it.isNotBlank() }?.let { "@$it" }
             val kind = when (row["type"]) { "group" -> "Группа"; "channel" -> "Канал"; "bot" -> "Бот"; else -> "Личный чат" }
-            val subtitle = if (pending) "Запрос отправлен" else (username ?: kind) + note
+            val lastDate = runCatching { java.time.Instant.parse(row["last_message_date"].orEmpty()).atZone(java.time.ZoneId.systemDefault()).toLocalDate() }.getOrNull()
+            val dateLabel = lastDate?.takeIf { it.isBefore(java.time.LocalDate.now()) }?.format(java.time.format.DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+            val subtitle = if (pending) "Запрос отправлен" else (username ?: kind) + (dateLabel?.let { " · $it" } ?: "") + note
             val title = row["title"].orEmpty()
             button.text = android.text.SpannableString("$title\n$subtitle").apply {
                 setSpan(android.text.style.ForegroundColorSpan(Color.LTGRAY), title.length + 1, length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
@@ -87,18 +91,22 @@ class CatalogActivity : Activity() {
             avatar.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.rgb((Color.red(accent) + 45) / 5, (Color.green(accent) + 45) / 5, (Color.blue(accent) + 45) / 5)) }
             settingsButton.isAllCaps = false; settingsButton.setTextColor(Color.LTGRAY)
             settingsButton.backgroundTintList = null; settingsButton.setBackgroundColor(Color.TRANSPARENT)
+            settingsButton.visibility = if (selectedGroup == allTab) View.GONE else View.VISIBLE
             checkbox.setOnCheckedChangeListener(null)
             checkbox.isChecked = group.isNotBlank()
             checkbox.contentDescription = "Включить ${row["title"]} в экспорт"
             checkbox.setOnCheckedChangeListener { _, checked ->
                 try {
-                    val updated = BlockEdits.assign(rows, row["id"].orEmpty(), if (checked) selectedGroup else null)
+                    val target = if (selectedGroup == inactiveTab || selectedGroup == allTab) "Ungrouped" else selectedGroup
+                    val updated = BlockEdits.assign(rows, row["id"].orEmpty(), if (checked) target else null)
                     saveRows(updated); rows = updated; render()
                 } catch (error: Exception) { render(); message("Не удалось сохранить выбор: ${error.message}") }
             }
             button.contentDescription = "Открыть ${row["title"]} в Telegram"
             settingsButton.contentDescription = "Настройки и экспорт чата ${row["title"]}"
-            settingsButton.setOnClickListener { if (pending) startActivity(Intent(this@CatalogActivity, InactiveChatsActivity::class.java)) else editGroup(row) }
+            settingsButton.text = if (selectedGroup == inactiveTab && !pending) "✕" else "⋮"
+            settingsButton.contentDescription = if (selectedGroup == inactiveTab && !pending) "Удалить или покинуть ${row["title"]}" else "Настройки и экспорт чата ${row["title"]}"
+            settingsButton.setOnClickListener { if (pending) startActivity(Intent(this@CatalogActivity, InactiveChatsActivity::class.java)) else if (selectedGroup == inactiveTab) confirmRemoveDialog(row) else editGroup(row) }
             fun open() {
                 val link = TelegramLink.from(row)
                 if (link != null) {
@@ -110,7 +118,7 @@ class CatalogActivity : Activity() {
             val gestures = GestureDetector(this@CatalogActivity, object : GestureDetector.SimpleOnGestureListener() {
                 override fun onDown(e: MotionEvent): Boolean = true
                 override fun onSingleTapConfirmed(e: MotionEvent): Boolean { open(); return true }
-                override fun onDoubleTap(e: MotionEvent): Boolean { if (pending) startActivity(Intent(this@CatalogActivity, InactiveChatsActivity::class.java)) else showChatActions(row); return true }
+                override fun onDoubleTap(e: MotionEvent): Boolean { if (pending) startActivity(Intent(this@CatalogActivity, InactiveChatsActivity::class.java)) else editGroup(row); return true }
                 override fun onLongPress(e: MotionEvent) { if (pending) startActivity(Intent(this@CatalogActivity, InactiveChatsActivity::class.java)) else showChatActions(row) }
                 override fun onFling(first: MotionEvent?, last: MotionEvent, velocityX: Float, velocityY: Float): Boolean = handleSwipe(first, last, velocityX)
             })
@@ -149,6 +157,10 @@ class CatalogActivity : Activity() {
         }
     }
     private var greetingRequested = false
+    @Volatile private var refreshRunning = false
+    private var refreshStartX = 0f
+    private var refreshStartY = 0f
+    private var refreshPull = false
     private var selectedGroup = "Ungrouped"
     private var loaded = true
     private var catalogVersion = "missing"
@@ -158,6 +170,92 @@ class CatalogActivity : Activity() {
     }
     private fun dp(v: Int) = (v * resources.displayMetrics.density + .5f).toInt()
     private fun message(text: String) { status.text = text }
+    private fun refreshTelegram(force: Boolean) {
+        if (!loaded) { if (force) android.widget.Toast.makeText(this, "Каталог недоступен: восстановите CSV в настройках", android.widget.Toast.LENGTH_LONG).show(); return }
+        if (refreshRunning) { if (force) android.widget.Toast.makeText(this, "Обновление уже выполняется", android.widget.Toast.LENGTH_SHORT).show(); return }
+        val prefs = getSharedPreferences("catalog_refresh", MODE_PRIVATE)
+        val elapsed = System.currentTimeMillis() - prefs.getLong("last_attempt", 0L)
+        val minimum = if (force) 60_000L else 15 * 60_000L
+        if (elapsed in 0 until minimum) {
+            if (force) android.widget.Toast.makeText(this, "Недавнее обновление: попробуйте через ${(minimum - elapsed + 999) / 1000} сек.", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val credentials = runCatching { SecureCredentialStore(this).load() }.getOrNull() ?: run {
+            if (force) android.widget.Toast.makeText(this, "Сначала подключите Telegram в меню аккаунта", android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+        refreshRunning = true
+        prefs.edit().putLong("last_attempt", System.currentTimeMillis()).apply()
+        if (force) android.widget.Toast.makeText(this, "Обновляем список чатов…", android.widget.Toast.LENGTH_SHORT).show()
+        worker.execute {
+            try {
+                val p = JSONObject().put("api_id", credentials.apiId).put("api_hash", credentials.apiHash)
+                val account = TelegramBridge.runJob(applicationContext, "account.status", p)
+                check(account.optString("status") == "authenticated") { "Сначала войдите в Telegram" }
+                val accountId = account.optJSONObject("account")?.optString("telegram_id").orEmpty()
+                val catalog = ChatCatalog(filesDir.resolve("chats.csv"))
+                val (current, version) = catalog.loadVersioned()
+                val binding = getSharedPreferences("catalog_account", MODE_PRIVATE)
+                val boundId = binding.getString("telegram_id", null)
+                CatalogAccountBinding.validate(boundId, accountId, current.isNotEmpty())
+                if (boundId == null) check(binding.edit().putString("telegram_id", accountId).commit())
+                val sync = TelegramBridge.runJob(applicationContext, "dialogs.sync", p)
+                check(sync.optInt("synced") > 0 || current.isEmpty()) { "Telegram вернул пустой список; текущий каталог сохранён. Проверьте соединение и аккаунт." }
+                val syncedArray = sync.optJSONArray("synced_ids") ?: org.json.JSONArray()
+                val liveIds = (0 until syncedArray.length()).map { syncedArray.optString(it) }.toSet()
+                val removedPrefs = getSharedPreferences("removed_dialogs", MODE_PRIVATE)
+                val removed = removedPrefs.getStringSet(accountId, emptySet()).orEmpty().toSet() - liveIds
+                val byId = current.associateBy { it["id"].orEmpty() }.toMutableMap()
+                var offset = 0
+                do {
+                    val items = TelegramBridge.dispatch(applicationContext, "dialogs.list", JSONObject().put("limit", 500).put("offset", offset)).getJSONArray("items")
+                    for (i in 0 until items.length()) {
+                        val dialog = items.getJSONObject(i); val id = dialog.getString("telegram_id")
+                        if (id in removed) continue
+                        val row = byId.getOrPut(id) { ChatCatalog.columns.associateWith { "" }.toMutableMap().also(current::add) }
+                        row["id"] = id; row["title"] = DialogTitle.choose(dialog.optString("title", ""), row["title"], dialog.optString("username", ""), id)
+                        row["type"] = when (dialog.optString("kind")) { "group" -> "group"; "channel" -> "channel"; "bot" -> "bot"; else -> "chat" }
+                        val username = dialog.optString("username", "").let { if (it == "null") "" else it }
+                        row["link"] = TelegramLink.refreshed(row["username"].orEmpty(), row["link"].orEmpty(), username); row["username"] = username
+                        val date = dialog.optString("last_message_at", "").let { if (it == "null") "" else it }
+                        if (date.isNotBlank()) row["last_message_date"] = date
+                        if (row["added_via"].isNullOrBlank()) row["added_via"] = "Telegram"
+                        if (row["added_at"].isNullOrBlank()) row["added_at"] = java.time.Instant.now().toString()
+                    }
+                    offset += items.length()
+                } while (items.length() == 500)
+                val folderPrefs = getSharedPreferences("telegram_folder_links", MODE_PRIVATE)
+                val links = runCatching { org.json.JSONArray(folderPrefs.getString(accountId, "[]")) }.getOrDefault(org.json.JSONArray())
+                if (links.length() > 0) {
+                    val folders = TelegramBridge.runJob(applicationContext, "dialogs.folders", JSONObject(p.toString()).put("expected_account_id", accountId)).getJSONArray("folders")
+                    for (n in 0 until links.length()) {
+                        val link = links.getJSONObject(n)
+                        val folder = (0 until folders.length()).map { folders.getJSONObject(it) }.firstOrNull { it.optString("id") == link.optString("id") } ?: continue
+                        // An incomplete Telegram folder snapshot must never remove memberships.
+                        if (folder.optInt("uncertain") != 0) continue
+                        val group = link.optString("group")
+                        val items = folder.getJSONArray("dialogs")
+                        val incoming = (0 until items.length()).map { items.getJSONObject(it).optString("id") }.toSet()
+                        val old = link.optJSONArray("managed") ?: org.json.JSONArray()
+                        val previouslyManaged = (0 until old.length()).map { old.optString(it) }.toSet()
+                        current.forEach { row ->
+                            val id = row["id"].orEmpty(); val assigned = row["blocks"].orEmpty()
+                            if (id in previouslyManaged && id !in incoming && assigned.equals(group, true)) row["blocks"] = ""
+                            else if (id in incoming && assigned.isBlank()) row["blocks"] = group
+                        }
+                        link.put("managed", org.json.JSONArray(current.filter { it["id"] in incoming && it["blocks"].orEmpty().equals(group, true) }.map { it["id"] }))
+                    }
+                }
+                catalog.save(current, expectedVersion = version)
+                removedPrefs.edit().putStringSet(accountId, removed).apply()
+                if (links.length() > 0) folderPrefs.edit().putString(accountId, links.toString()).apply()
+                DialogAvailabilityStore.save(applicationContext, accountId, sync)
+                runOnUiThread { if (alive) { reloadCatalog(); if (force) android.widget.Toast.makeText(this, "Обновлено чатов: ${sync.optInt("synced")}", android.widget.Toast.LENGTH_SHORT).show() } }
+            } catch (error: Exception) {
+                runOnUiThread { if (alive) { message("Не удалось обновить список: ${error.message}"); if (force) android.widget.Toast.makeText(this, "Не удалось обновить: ${error.message}", android.widget.Toast.LENGTH_LONG).show() } }
+            } finally { refreshRunning = false }
+        }
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         Appearance.apply(this)
         super.onCreate(savedInstanceState)
@@ -201,7 +299,7 @@ class CatalogActivity : Activity() {
         val searchLine = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
         searchLine.addView(search, LinearLayout.LayoutParams(0, -2, 1f))
         searchLine.addView(icon("⋮", "Фильтры поиска") {
-                val names = arrayOf("@group — группы", "@channel — каналы", "@chat — личные чаты", "@active — активные")
+                val names = arrayOf("@group — группы", "@channel — каналы", "@chat — личные чаты", "@active — сообщения за период активности")
                 AlertDialog.Builder(this@CatalogActivity).setTitle("Добавить фильтр").setItems(names) { _, index ->
                     val token = names[index].substringBefore(' ')
                     val previous = search.text.toString().trim()
@@ -225,6 +323,7 @@ class CatalogActivity : Activity() {
         screenRoot = FrameLayout(this).apply { addView(page, FrameLayout.LayoutParams(-1, -1)) }
         setContentView(screenRoot)
         SystemInsets.apply(this, page)
+        ReleaseUpdates.check(this)
         Appearance.tint(window.decorView, Appearance.color(this))
         savedInstanceState?.let { saved ->
             selectedGroup = saved.getString("selected_group", "Ungrouped")
@@ -237,6 +336,25 @@ class CatalogActivity : Activity() {
             startActivity(Intent(this, TelegramActivity::class.java))
         }
     }
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (::list.isInitialized && menuOverlay == null) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    val position = IntArray(2); list.getLocationOnScreen(position)
+                    refreshStartX = event.rawX; refreshStartY = event.rawY
+                    refreshPull = event.rawX >= position[0] && event.rawX < position[0] + list.width &&
+                        event.rawY >= position[1] && event.rawY < position[1] + list.height &&
+                        list.firstVisiblePosition == 0 && (list.getChildAt(0)?.top ?: 0) >= list.paddingTop
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (refreshPull && event.rawY - refreshStartY > dp(120) && kotlin.math.abs(event.rawX - refreshStartX) < dp(80)) refreshTelegram(true)
+                    refreshPull = false
+                }
+                MotionEvent.ACTION_CANCEL -> refreshPull = false
+            }
+        }
+        return super.dispatchTouchEvent(event)
+    }
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putString("selected_group", selectedGroup)
@@ -247,6 +365,7 @@ class CatalogActivity : Activity() {
         summaryHandler.removeCallbacks(summaryTicker); summaryHandler.post(summaryTicker)
         if (::greeting.isInitialized) greeting.text = UserGreeting.text(this)
         if (::store.isInitialized && ::rows.isInitialized && runCatching { store.version() != catalogVersion }.getOrDefault(false)) reloadCatalog()
+        if (::rows.isInitialized) refreshTelegram(false)
         val onboarding = getSharedPreferences("onboarding", MODE_PRIVATE)
         if (onboarding.getBoolean("guide_pending", false)) {
             onboarding.edit().putBoolean("guide_pending", false).apply()
@@ -285,7 +404,22 @@ class CatalogActivity : Activity() {
     private fun openMenu() {
         if (menuOverlay != null) return
         val overlay = FrameLayout(this)
-        val scrim = View(this).apply { setBackgroundColor(0x99000000.toInt()); alpha = 0f; setOnClickListener { closeMenu() } }
+        val scrim = View(this).apply {
+            setBackgroundColor(0x99000000.toInt()); alpha = 0f
+            setOnClickListener { closeMenu() }
+            var startX = 0f; var startY = 0f
+            setOnTouchListener { view, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> { startX = event.x; startY = event.y; true }
+                    MotionEvent.ACTION_UP -> {
+                        if (kotlin.math.abs(event.x - startX) > dp(48) || kotlin.math.abs(event.y - startY) > dp(48)) closeMenu()
+                        else view.performClick()
+                        true
+                    }
+                    else -> true
+                }
+            }
+        }
         overlay.addView(scrim, FrameLayout.LayoutParams(-1, -1))
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.rgb(23, 25, 29)); elevation = dp(18).toFloat()
@@ -319,10 +453,24 @@ class CatalogActivity : Activity() {
         item("◷", "История и справка") { startActivity(Intent(this, NativeActivity::class.java)) }
         section("НАСТРОЙКИ")
         item("◷", "Расписание и хранение") { startActivity(Intent(this, ScheduleActivity::class.java)) }
+        item("✉", "Отправка на почту") { startActivity(Intent(this, MailSettingsActivity::class.java)) }
         item("▤", "Каталог и CSV") { catalogSettings() }
+        item("▦", "Вкладки и блоки") { blockSettings() }
         item("◉", "Цвет интерфейса") { Appearance.showOptions(this) { recreate() } }
         item("◌", "Неактивные чаты") { startActivity(Intent(this, InactiveChatsActivity::class.java)) }
+        section("О ПРИЛОЖЕНИИ")
+        item("ⓘ", "О Tegash") { startActivity(Intent(this, AboutActivity::class.java)) }
         panel.addView(ScrollView(this).apply { addView(content) }, LinearLayout.LayoutParams(-1, 0, 1f))
+        val prefs = ExportSchedule.prefs(this)
+        val next = if (prefs.getBoolean("enabled", false)) prefs.getString("next_due", null)?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() } else null
+        val last = ExportHistory.latest(this)
+        val display = java.time.format.DateTimeFormatter.ofPattern("dd.MM HH:mm").withZone(java.time.ZoneId.systemDefault())
+        panel.addView(TextView(this).apply {
+            text = "Последний: ${last?.let(display::format) ?: "нет"}\nСледующий: ${next?.let(display::format) ?: "не запланирован"}"
+            textSize = 12f; setTextColor(Color.LTGRAY); alpha = 0.6f
+            gravity = android.view.Gravity.END; setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener { closeMenu(); startActivity(Intent(this@CatalogActivity, ScheduleActivity::class.java)) }
+        })
         screenRoot.addView(overlay, FrameLayout.LayoutParams(-1, -1)); menuOverlay = overlay
         SystemInsets.apply(this, panel)
         panel.translationX = -width.toFloat(); panel.animate().translationX(0f).setDuration(220).start()
@@ -338,7 +486,7 @@ class CatalogActivity : Activity() {
     @Deprecated("Back button support on Android versions without predictive back")
     override fun onBackPressed() { if (menuOverlay != null) closeMenu() else super.onBackPressed() }
     private fun addClipboardChat() {
-        if (selectedGroup == inactiveTab) {
+        if (selectedGroup == inactiveTab || selectedGroup == allTab) {
             android.widget.Toast.makeText(this, "Выберите блок для нового чата", android.widget.Toast.LENGTH_SHORT).show(); return
         }
         val clipboard = getSystemService(android.content.ClipboardManager::class.java)
@@ -415,38 +563,76 @@ class CatalogActivity : Activity() {
                                 AlertDialog.Builder(this).setTitle("Импортировать «$name»?")
                                     .setMessage("Чатов: ${incoming.size}; уже в других блоках: $conflicts; не удалось определить: ${folder.optInt("uncertain")}. Выберите, что делать с конфликтами.")
                                     .setNegativeButton("Отмена", null)
-                                    .setNeutralButton("Оставить") { _, _ -> importFolder(version, incoming, name, false) }
-                                    .setPositiveButton("Переместить") { _, _ -> importFolder(version, incoming, name, true) }.show()
+                                    .setNeutralButton("Оставить") { _, _ -> importFolder(version, incoming, name, false, accountId, folder.optString("id")) }
+                                    .setPositiveButton("Переместить") { _, _ -> importFolder(version, incoming, name, true, accountId, folder.optString("id")) }.show()
                             }.setNegativeButton("Отмена", null).show()
                     }
                 } catch (error: Exception) { runOnUiThread { if (alive) message("Не удалось загрузить папки: ${error.message}") } }
             }
         } catch (error: Exception) { message(error.message ?: "Не удалось загрузить папки") }
     }
-    private fun importFolder(version: String, incoming: List<Map<String, String>>, name: String, move: Boolean) {
+    private fun importFolder(version: String, incoming: List<Map<String, String>>, name: String, move: Boolean, accountId: String, folderId: String) {
         try {
             require(version == catalogVersion) { "Каталог изменился. Повторите импорт папки." }
             val updated = FolderImport.apply(rows, incoming, name, move)
             saveRows(updated); rows = updated; selectedGroup = BlockEdits.canonical(rows, name); render()
+            val prefs = getSharedPreferences("telegram_folder_links", MODE_PRIVATE)
+            val links = runCatching { org.json.JSONArray(prefs.getString(accountId, "[]")) }.getOrDefault(org.json.JSONArray())
+            val remaining = org.json.JSONArray()
+            for (i in 0 until links.length()) if (links.getJSONObject(i).optString("id") != folderId) remaining.put(links.getJSONObject(i))
+            val ids = incoming.map { it["id"] }.toSet()
+            val managed = updated.filter { it["id"] in ids && it["blocks"].orEmpty().equals(name, true) }.map { it["id"] }
+            remaining.put(JSONObject().put("id", folderId).put("group", name).put("managed", org.json.JSONArray(managed)))
+            prefs.edit().putString(accountId, remaining.toString()).apply()
             message("Папка импортирована; проверьте выбранные чаты")
         } catch (error: Exception) { message("Не удалось импортировать папку: ${error.message}") }
     }
     private fun render() {
         tabs.removeAllViews()
-        val groups = listOf("Ungrouped") + rows.mapNotNull { it["blocks"]?.takeIf { name -> name.isNotBlank() && !name.equals("Ungrouped", true) } }.distinct().sortedBy { it.lowercase() }
-        if (selectedGroup != inactiveTab && selectedGroup !in groups) selectedGroup = "Ungrouped"
+        val groups = listOf("Ungrouped") + orderedBlocks()
+        if (selectedGroup != inactiveTab && selectedGroup != allTab && selectedGroup !in groups) selectedGroup = "Ungrouped"
         groups.forEach { group ->
             tabs.addView(Button(this).apply {
                 text = group; styleTab(this, group == selectedGroup)
-                setOnClickListener { selectedGroup = group; render() }
-                if (group != "Ungrouped") setOnLongClickListener { manageGroup(group); true }
+                val gestures = GestureDetector(this@CatalogActivity, object : GestureDetector.SimpleOnGestureListener() {
+                    override fun onDown(e: MotionEvent) = true
+                    override fun onSingleTapConfirmed(e: MotionEvent): Boolean { selectedGroup = group; render(); return true }
+                    override fun onDoubleTap(e: MotionEvent): Boolean { showBlockSettings(group); return true }
+                    override fun onLongPress(e: MotionEvent) { startActivity(Intent(this@CatalogActivity, ExportActivity::class.java).putExtra("block_name", group)) }
+                })
+                setOnTouchListener { _, event -> gestures.onTouchEvent(event); true }
             })
         }
         tabs.addView(Button(this).apply {
             text = "Неактивные"; styleTab(this, selectedGroup == inactiveTab)
-            setOnClickListener { selectedGroup = inactiveTab; render() }
+            val gestures = GestureDetector(this@CatalogActivity, object : GestureDetector.SimpleOnGestureListener() {
+                override fun onDown(e: MotionEvent) = true
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean { selectedGroup = inactiveTab; render(); return true }
+                override fun onDoubleTap(e: MotionEvent): Boolean { startActivity(Intent(this@CatalogActivity, InactiveChatsActivity::class.java)); return true }
+            })
+            setOnTouchListener { _, event -> gestures.onTouchEvent(event); true }
         })
-        tabs.addView(icon("+", "Создать блок") { createGroup() }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        tabs.addView(Button(this).apply {
+            text = "Все чаты"; styleTab(this, selectedGroup == allTab)
+            val gestures = GestureDetector(this@CatalogActivity, object : GestureDetector.SimpleOnGestureListener() {
+                override fun onDown(e: MotionEvent) = true
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean { selectedGroup = allTab; render(); return true }
+                override fun onDoubleTap(e: MotionEvent): Boolean { blockSettings(); return true }
+            })
+            setOnTouchListener { _, event -> gestures.onTouchEvent(event); true }
+        })
+        tabs.addView(icon("+", "Добавить блок") {
+            AlertDialog.Builder(this).setTitle("Добавить блок")
+                .setItems(arrayOf("Создать вручную", "Из папки Telegram", "Как это работает?")) { _, choice ->
+                    when (choice) {
+                        0 -> createGroup()
+                        1 -> loadTelegramFolders()
+                        else -> AlertDialog.Builder(this).setTitle("Блок из папки Telegram")
+                            .setMessage("Выберите существующую папку Telegram: Tegash создаст блок с её названием и добавит в него чаты. Если чат уже находится в другом блоке, можно оставить его там или переместить.\n\nПри обновлении списка изменения папки учитываются автоматически: новые чаты без блока добавляются, удалённые из папки выходят из связанного блока. Чаты в другом блоке не перемещаются без подтверждения. Папки Telegram при этом не изменяются.")
+                            .setPositiveButton("Выбрать папку") { _, _ -> loadTelegramFolders() }.setNegativeButton("Закрыть", null).show()
+                    }
+                }.setNegativeButton("Отмена", null).show()
+        }, LinearLayout.LayoutParams(dp(44), dp(44)))
         val query = search.text.toString().trim()
         val now = java.time.Instant.now()
         val activeDays = getSharedPreferences("catalog_settings", MODE_PRIVATE).getInt("inactive_days", 30).coerceIn(1, 36500)
@@ -457,13 +643,14 @@ class CatalogActivity : Activity() {
         val unanswered = if (snapshot != null) availability.getStringSet("unanswered_bot_ids", emptySet()).orEmpty() else emptySet()
         val visible = rows.filter { row ->
             val group = row["blocks"].orEmpty()
-            val inGroup = when (selectedGroup) {
+            val inGroup = if (query.isNotBlank()) true else when (selectedGroup) {
+                allTab -> true
                 inactiveTab -> {
                     val id = row["id"].orEmpty()
                     val date = runCatching { java.time.Instant.parse(row["last_message_date"].orEmpty()) }.getOrNull()
                     id in empty || id in unanswered || DialogAvailability.unavailable(id, snapshot) || date == null || date < now.minusSeconds(activeDays.toLong() * 86400)
                 }
-                "Ungrouped" -> group.isBlank() || group.equals("Ungrouped", true)
+                "Ungrouped" -> group.equals("Ungrouped", true)
                 else -> group == selectedGroup
             }
             inGroup && CatalogSearch.matches(row, query, now, activeDays)
@@ -472,7 +659,16 @@ class CatalogActivity : Activity() {
             val reference = entry.optString("reference")
             mutableMapOf("id" to key, "type" to "pending", "title" to entry.optString("title").ifBlank { reference }, "blocks" to "", "link" to reference, "username" to if (reference.startsWith("@")) reference else "")
         }.filter { CatalogSearch.matches(it, query, now, activeDays) } else emptyList()
-        visibleRows = (pendingEntries + visible).sortedWith(compareBy({ it["type"] != "pending" }, { it["blocks"].isNullOrBlank() }, { it["title"].orEmpty().lowercase() }))
+        val recentOrder = compareByDescending<MutableMap<String, String>> { row ->
+            runCatching { java.time.Instant.parse(row["last_message_date"].orEmpty()) }.getOrDefault(java.time.Instant.MIN)
+        }
+        val oldestOrder = compareBy<MutableMap<String, String>> { row ->
+            runCatching { java.time.Instant.parse(row["last_message_date"].orEmpty()) }.getOrDefault(java.time.Instant.MAX)
+        }
+        visibleRows = pendingEntries.sortedBy { it["title"].orEmpty().lowercase() } + visible.sortedWith(
+            compareBy<MutableMap<String, String>> { row -> selectedGroup == allTab && row["blocks"].isNullOrBlank() }
+            .then(if (selectedGroup == inactiveTab) oldestOrder else recentOrder).thenBy { it["title"].orEmpty().lowercase() }
+        )
         chatAdapter.notifyDataSetChanged()
         val pending = pendingEntries.size
         message("${visible.size} из ${rows.size} чатов · ${rows.count { !it["blocks"].isNullOrBlank() }} выбрано." + if (pending > 0) " Заявок: $pending · нажмите для просмотра." else "")
@@ -493,7 +689,7 @@ class CatalogActivity : Activity() {
         contentDescription = description; isClickable = true; isFocusable = true; setOnClickListener { action() }
     }
     private fun moveTab(delta: Int) {
-        val groups = listOf("Ungrouped") + rows.mapNotNull { it["blocks"]?.takeIf { name -> name.isNotBlank() && !name.equals("Ungrouped", true) } }.distinct().sortedBy { it.lowercase() } + inactiveTab
+        val groups = listOf("Ungrouped") + orderedBlocks() + inactiveTab + allTab
         val index = groups.indexOf(selectedGroup).coerceAtLeast(0)
         if (delta < 0 && index == 0) { openMenu(); return }
         val next = (index + delta).coerceIn(0, groups.lastIndex)
@@ -526,24 +722,128 @@ class CatalogActivity : Activity() {
             }
         }.setNegativeButton("Отмена", null).show()
     }
+    private fun confirmRemoveDialog(row: Map<String, String>) {
+        val isCommunity = row["type"] in setOf("group", "channel")
+        val title = row["title"].orEmpty()
+        AlertDialog.Builder(this).setTitle(if (isCommunity) "Покинуть «$title»?" else "Удалить чат «$title»?")
+            .setMessage(if (isCommunity) "Приложение отправит Telegram запрос на выход и уберёт чат из каталога. Уже созданные архивы сохранятся." else "Чат и его история будут удалены из вашего Telegram. У собеседника история не удаляется. Уже созданные архивы сохранятся.")
+            .setNegativeButton("Отмена", null).setPositiveButton(if (isCommunity) "Покинуть" else "Удалить") { _, _ ->
+                val id = row["id"].orEmpty()
+                worker.execute {
+                    try {
+                        val credentials = SecureCredentialStore(applicationContext).load() ?: error("Сначала подключите Telegram")
+                        val account = getSharedPreferences("catalog_account", MODE_PRIVATE).getString("telegram_id", null) ?: error("Сначала обновите каталог")
+                        val params = JSONObject().put("api_id", credentials.apiId).put("api_hash", credentials.apiHash).put("expected_account_id", account).put("dialog_id", id.toLong())
+                        TelegramBridge.runJob(applicationContext, "dialogs.remove", params)
+                        val removedPrefs = getSharedPreferences("removed_dialogs", MODE_PRIVATE)
+                        val removed = removedPrefs.getStringSet(account, emptySet()).orEmpty().toMutableSet().apply { add(id) }
+                        check(removedPrefs.edit().putStringSet(account, removed).commit()) { "Не удалось сохранить состояние каталога" }
+                        val catalog = ChatCatalog(filesDir.resolve("chats.csv")); val (current, version) = catalog.loadVersioned()
+                        catalog.save(current.filter { it["id"] != id }, expectedVersion = version)
+                        runOnUiThread { if (alive) { reloadCatalog(); android.widget.Toast.makeText(this, "Готово", android.widget.Toast.LENGTH_SHORT).show() } }
+                    } catch (error: Exception) { runOnUiThread { if (alive) android.widget.Toast.makeText(this, "Не удалось завершить действие: ${error.message}", android.widget.Toast.LENGTH_LONG).show() } }
+                }
+            }.show()
+    }
+    private fun orderKey() = getSharedPreferences("catalog_account", MODE_PRIVATE).getString("telegram_id", "unbound").orEmpty()
+    private fun orderedBlocks(): List<String> {
+        val groups = rows.mapNotNull { it["blocks"]?.takeIf { name -> name.isNotBlank() && !name.equals("Ungrouped", true) } }.distinct().sortedBy { it.lowercase() }
+        val saved = runCatching { org.json.JSONArray(getSharedPreferences("tab_order", MODE_PRIVATE).getString(orderKey(), "[]")) }.getOrDefault(org.json.JSONArray())
+        val order = (0 until saved.length()).map { saved.optString(it) }
+        return groups.sortedWith(compareBy<String> { val position = order.indexOf(it); if (position < 0) Int.MAX_VALUE else position }.thenBy { it.lowercase() })
+    }
+    private fun reorderBlocks() {
+        val groups = orderedBlocks()
+        if (groups.isEmpty()) { message("Сначала создайте блоки"); return }
+        AlertDialog.Builder(this).setTitle("Порядок блоков")
+            .setItems(groups.mapIndexed { i, group -> "${i + 1}. $group" }.toTypedArray()) { _, index ->
+                AlertDialog.Builder(this).setTitle(groups[index]).setItems(arrayOf("Переместить выше", "Переместить ниже")) { _, direction ->
+                    val next = (index + if (direction == 0) -1 else 1).coerceIn(0, groups.lastIndex)
+                    val changed = groups.toMutableList(); java.util.Collections.swap(changed, index, next)
+                    getSharedPreferences("tab_order", MODE_PRIVATE).edit().putString(orderKey(), org.json.JSONArray(changed).toString()).apply()
+                    render(); reorderBlocks()
+                }.setNegativeButton("Назад") { _, _ -> reorderBlocks() }.show()
+            }.setNegativeButton("Готово", null).show()
+    }
+    private fun showBlockSettings(group: String) {
+        val actions = if (group == "Ungrouped") arrayOf("Промпт для ИИ", "Экспортировать блок") else arrayOf("Промпт для ИИ", "Экспортировать блок", "Переименовать или удалить")
+        AlertDialog.Builder(this).setTitle(group).setItems(actions) { _, choice ->
+            when (choice) {
+                0 -> editPrompt(group)
+                1 -> startActivity(Intent(this, ExportActivity::class.java).putExtra("block_name", group))
+                else -> manageGroup(group)
+            }
+        }.setNegativeButton("Назад") { _, _ -> blockSettings() }.show()
+    }
+    private fun blockSettings() {
+        val groups = listOf("Ungrouped") + orderedBlocks()
+        AlertDialog.Builder(this).setTitle("Вкладки и блоки")
+            .setItems((groups + listOf("Порядок вкладок", "＋ Создать блок", "Импортировать папку Telegram")).toTypedArray()) { _, index ->
+                when (index) {
+                    groups.size -> reorderBlocks()
+                    groups.size + 1 -> createGroup()
+                    groups.size + 2 -> loadTelegramFolders()
+                    else -> showBlockSettings(groups[index])
+                }
+            }.setNegativeButton("Закрыть", null).show()
+    }
+    private fun editPrompt(group: String) {
+        val account = getSharedPreferences("catalog_account", MODE_PRIVATE).getString("telegram_id", null)
+        if (account.isNullOrBlank()) { message("Сначала подключите аккаунт и обновите каталог"); return }
+        val field = EditText(this).apply {
+            hint = "Инструкция для ИИ; пустое поле отключает добавление файла"
+            setText(BlockPrompts.get(this@CatalogActivity, account, group))
+            setMinLines(7); setMaxLines(14); setPadding(dp(16), dp(8), dp(16), dp(8))
+        }
+        val dialog = AlertDialog.Builder(this).setTitle("Промпт · $group")
+            .setMessage("Будет сохранён в AI_PROMPT.txt внутри папки блока в ZIP. Для Ungrouped — в корне архива.")
+            .setView(field).setNegativeButton("Отмена", null).setNeutralButton("Шаблон", null)
+            .setPositiveButton("Сохранить") { _, _ ->
+                runCatching { BlockPrompts.save(this, account, group, field.text.toString()) }
+                    .onSuccess { android.widget.Toast.makeText(this, "Промпт сохранён", android.widget.Toast.LENGTH_SHORT).show() }
+                    .onFailure { message("Не удалось сохранить промпт: ${it.message}") }
+            }.create()
+        dialog.setOnShowListener { dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+            if (field.text.isNotBlank()) AlertDialog.Builder(this).setTitle("Заменить текст шаблоном?")
+                .setNegativeButton("Отмена", null).setPositiveButton("Заменить") { _, _ -> field.setText(BlockPrompts.TEMPLATE) }.show()
+            else field.setText(BlockPrompts.TEMPLATE)
+        } }
+        dialog.show()
+    }
     private fun manageGroup(group: String) {
         AlertDialog.Builder(this).setTitle(group).setItems(arrayOf("Переименовать блок", "Удалить блок")) { _, choice ->
             if (choice == 0) {
                 val name = EditText(this).apply { setText(group); setSingleLine() }
                 AlertDialog.Builder(this).setTitle("Переименовать блок").setView(name).setNegativeButton("Отмена", null)
                     .setPositiveButton("Сохранить") { _, _ ->
-                        try { val updated = BlockEdits.rename(rows, group, name.text.toString()); saveRows(updated); rows = updated; selectedGroup = name.text.toString().trim(); render() }
+                        try { val updated = BlockEdits.rename(rows, group, name.text.toString()); saveRows(updated); rows = updated; selectedGroup = name.text.toString().trim(); updateFolderLinks(group, selectedGroup); render() }
                         catch (error: Exception) { message("Не удалось переименовать: ${error.message}") }
                     }.show()
             } else {
                 AlertDialog.Builder(this).setTitle("Удалить блок «$group»?")
                     .setMessage("Чаты останутся в каталоге, но без блока они не будут участвовать в обычном экспорте.")
                     .setNegativeButton("Отмена", null).setPositiveButton("Удалить блок") { _, _ ->
-                        try { val updated = BlockEdits.remove(rows, group); saveRows(updated); rows = updated; selectedGroup = "Ungrouped"; render() }
+                        try { val updated = BlockEdits.remove(rows, group); saveRows(updated); rows = updated; updateFolderLinks(group, null); selectedGroup = "Ungrouped"; render() }
                         catch (error: Exception) { message("Не удалось удалить блок: ${error.message}") }
                     }.show()
             }
         }.setNegativeButton("Отмена", null).show()
+    }
+    private fun updateFolderLinks(group: String, replacement: String?) {
+        val accountId = getSharedPreferences("catalog_account", MODE_PRIVATE).getString("telegram_id", null) ?: return
+        BlockPrompts.move(this, accountId, group, replacement)
+        val prefs = getSharedPreferences("telegram_folder_links", MODE_PRIVATE)
+        val links = runCatching { org.json.JSONArray(prefs.getString(accountId, "[]")) }.getOrDefault(org.json.JSONArray())
+        val result = org.json.JSONArray()
+        for (i in 0 until links.length()) {
+            val link = links.getJSONObject(i)
+            if (link.optString("group").equals(group, true)) {
+                if (replacement == null) continue
+                link.put("group", replacement)
+            }
+            result.put(link)
+        }
+        prefs.edit().putString(accountId, result.toString()).apply()
     }
     private fun createGroup() {
         val name = EditText(this).apply { hint = "Название блока"; setSingleLine() }

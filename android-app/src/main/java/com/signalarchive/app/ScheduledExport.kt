@@ -78,6 +78,7 @@ class ScheduledExportService : JobService() {
             var target: Uri? = null
             var savedArchive: Uri? = null
             var hadMessages = false
+            var mailFailed = false
             var retryWhenAvailable = false
             val intermediates = mutableListOf<File>()
             try {
@@ -107,12 +108,14 @@ class ScheduledExportService : JobService() {
                             .put("expected_account_id", accountId)
                             .put("period_start", start.toString()).put("period_end", end.toString())
                         try {
-                            val result = TelegramBridge.runJob(applicationContext, "messages.export", request, allowPartial = true)
+                            val result = TelegramBridge.runExportWithRetry(applicationContext, "messages.export", request) { note ->
+                                if (note.startsWith("Пауза Telegram")) ExportNotifications.progress(applicationContext, 0x534165, note)
+                            }
                             IntermediateExports.checked(filesDir, result.getString("file_path")).also(intermediates::add)
                         } catch (error: TelegramJobException) {
                             if (error.code == "empty_message_range") null else throw error
                         }
-                    }, allowEmpty = true) { index, total, _ ->
+                    }, allowEmpty = true, prompts = BlockPrompts.forChats(applicationContext, accountId, chats)) { index, total, _ ->
                         ExportProgress.update(progressId, total - index)
                         ExportNotifications.progress(applicationContext, 0x534165, "Осталось чатов: ${total - index}", index, total)
                     }
@@ -126,8 +129,7 @@ class ScheduledExportService : JobService() {
                     val expectedSize = temporary.length()
                     val sha256 = temporary.inputStream().use(RetentionPolicy::sha256)
                     val parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
-                    val stamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(java.time.ZoneOffset.UTC).format(end)
-                    val finalName = "Tegash-$stamp.zip"
+                    val finalName = ArchiveNames.reserveInFolder(applicationContext, tree, ArchiveNames.base(chats.map { it.group }, start, end))
                     // A process kill may interrupt the copy. A .part suffix
                     // prevents a partial upload from looking like a complete ZIP.
                     target = DocumentsContract.createDocument(contentResolver, parent, "application/octet-stream", "$finalName.part")
@@ -146,9 +148,13 @@ class ScheduledExportService : JobService() {
                     runCatching { ExportHistory.add(applicationContext, "По расписанию", completedUri.toString(), end) }
                     check(ArchiveRetention.record(applicationContext, tree, completedUri, end, expectedSize, sha256)) { "ZIP сохранён, но не удалось сохранить журнал архивов" }
                     check(ExportCheckpoint.advanceChats(applicationContext, ids, key, start, end)) { "ZIP сохранён, но не удалось сохранить время экспорта" }
+                    if (prefs.getBoolean("email_enabled", false)) {
+                        try { MailSettings.send(applicationContext, temporary, finalName) }
+                        catch (_: Exception) { mailFailed = true }
+                    }
                   } finally { IntermediateExports.remove(intermediates); intermediates.clear(); ExportProgress.finish(progressId); ExportNotifications.clear(applicationContext, 0x534165) }
                 }
-                if (hadMessages) prefs.edit().putString("status", "Экспорт сохранён: $end").commit()
+                if (hadMessages) prefs.edit().putString("status", if (mailFailed) "Архив сохранён, но отправка на почту не удалась. Проверьте настройки и размер файла; повторно автоматически не отправляем." else "Экспорт сохранён: $end").commit()
                 if (prefs.getBoolean("retention_enabled", false)) {
                     val days = prefs.getInt("retention_days", 30)
                     if (days in 1..36500) {
@@ -162,7 +168,7 @@ class ScheduledExportService : JobService() {
                         }
                     }
                 }
-                if (hadMessages && savedArchive != null) ExportNotifications.completed(applicationContext, "Экспорт сохранён · нажмите, чтобы отправить", 0x534152, savedArchive)
+                if (hadMessages && savedArchive != null) ExportNotifications.completed(applicationContext, if (mailFailed) "Архив сохранён, почта не отправлена · нажмите, чтобы поделиться" else "Экспорт сохранён · нажмите, чтобы отправить", 0x534152, savedArchive)
                 else notifyResult("Новых сообщений нет")
             } catch (error: ExportBusyException) {
                 retryWhenAvailable = true

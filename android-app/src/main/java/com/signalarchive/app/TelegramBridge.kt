@@ -6,7 +6,7 @@ import com.chaquo.python.PyObject
 import com.chaquo.python.android.AndroidPlatform
 import org.json.JSONObject
 
-internal class TelegramJobException(val code: String, message: String) : IllegalStateException(message)
+internal class TelegramJobException(val code: String, message: String, val retryAfterSeconds: Long = 0) : IllegalStateException(message)
 
 /** A single owner for the embedded Telegram event loop and encrypted session. */
 internal object TelegramBridge {
@@ -190,7 +190,7 @@ internal object TelegramBridge {
                         val kind = error?.optString("exception_type").orEmpty().takeIf { it.matches(Regex("[A-Za-z0-9_]{1,80}")) }
                         if (kind != null && fallback == "Operation failed") "Ошибка Telegram: $kind" else fallback
                     }
-                    throw TelegramJobException(error?.optString("code").orEmpty(), message)
+                    throw TelegramJobException(error?.optString("code").orEmpty(), message, error?.optLong("retry_after_seconds", 0) ?: 0)
                 }
                 "cancelled" -> throw InterruptedException("Операция отменена")
             }
@@ -202,6 +202,20 @@ internal object TelegramBridge {
                 try { dispatch(context, "jobs.cancel", JSONObject().put("job_id", id)) }
                 finally { Thread.currentThread().interrupt() }
                 throw interrupted
+            }
+        }
+    }
+
+    /** Retry only short Telegram cooldowns for idempotent export jobs. */
+    fun runExportWithRetry(context: Context, operation: String, params: JSONObject, progress: (String) -> Unit = {}): JSONObject {
+        var attempts = 0
+        while (true) {
+            try { return runJob(context, operation, params, allowPartial = true, progress = progress) }
+            catch (error: TelegramJobException) {
+                val seconds = error.retryAfterSeconds
+                if (error.code != "flood_wait" || seconds !in 1..60 || attempts++ >= 3) throw error
+                progress("Пауза Telegram: $seconds сек. Продолжим автоматически.")
+                Thread.sleep((seconds + 1) * 1000)
             }
         }
     }

@@ -44,9 +44,11 @@ SIGNAL_ARCHIVE_PYTHON="$PWD/desktop/.venv-direct/bin/python" sh ./desktop/verify
 
 Run `python desktop/package_direct.py` to create an allowlisted source ZIP. Building a Windows executable requires a Windows environment; see the build guide. Local tests cannot by themselves establish that Telegram authorization or a Windows desktop works on a particular machine.
 
-Ideas, fixes, documentation, translations and testing across platforms are all welcome. For a change, describe the problem and include relevant checks; never include personal Telegram data or credentials. See [desktop/LICENSE](desktop/LICENSE) for the current desktop license.
+Ideas, fixes, documentation, translations and testing across platforms are all welcome. For a change, describe the problem and include relevant checks; never include personal Telegram data or credentials. See the [project license](LICENSE) for non-commercial use and redistribution terms and its scope; the existing desktop component remains MIT-licensed under [desktop/LICENSE](desktop/LICENSE). Third-party dependencies retain their own licenses.
 
 Android development priorities and remaining checks are in the [finalization plan](ANDROID_FINALIZATION_PLAN.md). Feedback and contributions are welcome through the [GitHub repository](https://github.com/aHDpeee/messagesAutomation); contact the author on [Telegram](https://t.me/ahdpeee).
+
+See [release notes and platform tags](RELEASES.md) and [the releases page](https://github.com/aHDpeee/messagesAutomation/releases) for available previews and update behavior.
 
 Signal Archive is developed by ahdpeee with help from Codex.
 

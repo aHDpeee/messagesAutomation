@@ -126,7 +126,7 @@ class JobManager:
                     raise ValueError("Job is not eligible for resume")
             else:
                 self._repository.create(job_id, job_type, params or {}, resumable)
-        network_jobs = {"account.send_code", "account.verify_code", "account.verify_password", "account.qr_start", "account.qr_wait", "account.status", "account.logout", "dialogs.sync", "dialogs.add", "dialogs.check_invite", "dialogs.folders", "messages.sync", "messages.preview_range", "participants.capture", "users.resolve", "media.download_dialog", "members.export_csv"}
+        network_jobs = {"account.send_code", "account.verify_code", "account.verify_password", "account.qr_start", "account.qr_wait", "account.status", "account.logout", "dialogs.sync", "dialogs.add", "dialogs.remove", "dialogs.check_invite", "dialogs.folders", "messages.sync", "messages.preview_range", "participants.capture", "users.resolve", "media.download_dialog", "members.export_csv"}
         requires_network = job_type in network_jobs or (job_type == "members.export" and (params or {}).get("source", "telegram") == "telegram") or (job_type in {"messages.export", "analytics.export"} and bool((params or {}).get("fetch_source")))
         job = Job(job_id=job_id, job_type=job_type, resumable=resumable, requires_network=requires_network)
         with self._lock:
@@ -180,6 +180,7 @@ class JobManager:
             else:
                 code = getattr(exc, "code", type(exc).__name__)
                 known_errors = {
+                    "SessionPasswordNeededError": ("password_required", "Telegram requires the two-step verification password."),
                     "PhoneCodeInvalidError": ("invalid_code", "The verification code is incorrect."),
                     "PhoneCodeExpiredError": ("expired_code", "The verification code expired. Request a new one."),
                     "PhoneNumberInvalidError": ("invalid_phone", "Enter the phone number with its country code."),

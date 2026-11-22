@@ -139,6 +139,8 @@ class ObservatoryApi:
             return self._submit("dialogs.sync", params)
         if operation == "dialogs.add":
             return self._submit("dialogs.add", params)
+        if operation == "dialogs.remove":
+            return self._submit("dialogs.remove", params)
         if operation == "dialogs.check_invite":
             return self._submit("dialogs.check_invite", params)
         if operation == "dialogs.folders":
@@ -282,6 +284,20 @@ class ObservatoryApi:
             report,
             report_progress=media_progress,
         )
+        async def remove_dialog() -> dict[str, Any]:
+            from tg_observatory.services.account_service import credentials_from
+            api_id, api_hash = credentials_from(params)
+            profile = await self._gateway.account_status(api_id, api_hash)
+            if profile is None or str(profile.telegram_id) != str(params.get("expected_account_id", "")):
+                raise InvalidRequest("The Telegram account changed; refresh the catalog first.")
+            dialog_id = int(params.get("dialog_id", 0))
+            if not dialog_id or dialog_id == profile.telegram_id:
+                raise InvalidRequest("This chat cannot be removed here.")
+            client = await self._gateway._connected_client(api_id, api_hash)
+            peer = await self._gateway._input_peer(client, dialog_id)
+            await client.delete_dialog(peer, revoke=False)
+            return {"status": "removed", "dialog_id": dialog_id}
+
         async def fetch_export_source() -> None:
             saved = params.get("_checkpoint") or {}
             if params.get("fetch_source") and saved and saved.get("source_scope_version") != 1:
@@ -398,6 +414,7 @@ class ObservatoryApi:
             "account.status": lambda: accounts.status(params),
             "account.logout": lambda: accounts.logout(),
             "dialogs.sync": lambda: dialogs.sync(params),
+            "dialogs.remove": remove_dialog,
             "dialogs.add": add_dialog,
             "dialogs.check_invite": check_invite,
             "dialogs.folders": list_folders,

@@ -19,7 +19,7 @@ import android.widget.TextView
 import java.util.concurrent.Executors
 
 /** Offline Android companion for archives produced by the desktop application. */
-class NativeActivity : Activity() {
+class NativeActivity : BackSwipeActivity() {
     private val worker = Executors.newSingleThreadExecutor()
     private lateinit var db: ArchiveDb
     private lateinit var status: TextView
@@ -65,12 +65,6 @@ class NativeActivity : Activity() {
         }
         page.addView(scheduleSummary)
         page.addView(Button(this).apply { text = "Как начать · автор и Codex"; setOnClickListener { showHelp() } })
-        page.addView(Button(this).apply { text = "Цвет интерфейса"; setOnClickListener {
-            Appearance.showOptions(this@NativeActivity) { recreate() }
-        } })
-        page.addView(Button(this).apply { text = "Подключить Telegram"; setOnClickListener { startActivity(Intent(this@NativeActivity, TelegramActivity::class.java)) } })
-        page.addView(Button(this).apply { text = "Экспортировать выбранные чаты"; setOnClickListener { startActivity(Intent(this@NativeActivity, ExportActivity::class.java)) } })
-        page.addView(Button(this).apply { text = "Расписание экспорта"; setOnClickListener { startActivity(Intent(this@NativeActivity, ScheduleActivity::class.java)) } })
         page.addView(Button(this).apply { text = "Последние экспорты"; setOnClickListener {
             val entries = ExportHistory.entries(this@NativeActivity)
             val dialog = AlertDialog.Builder(this@NativeActivity).setTitle("Последние экспорты")
@@ -84,7 +78,6 @@ class NativeActivity : Activity() {
             }
             dialog.setPositiveButton("Закрыть", null).show()
         } })
-        page.addView(Button(this).apply { text = "Экспорт участников групп"; setOnClickListener { startActivity(Intent(this@NativeActivity, MembersExportActivity::class.java)) } })
         status = label("Загрузка…", 14f).apply { setPadding(0, dp(16), 0, dp(12)) }
         page.addView(status)
         page.addView(Button(this).apply {
@@ -98,8 +91,6 @@ class NativeActivity : Activity() {
         })
         page.addView(label("Поддерживаются CSV сообщений и обычные ZIP из Tegash и Signal Archive. Зашифрованные ZIP пока не поддерживаются.", 13f, Color.LTGRAY))
         page.addView(Button(this).apply { text = "Показать чаты"; setOnClickListener { showChats() } })
-        page.addView(Button(this).apply { text = "Каталог и группы"; setOnClickListener { startActivity(Intent(this@NativeActivity, CatalogActivity::class.java)) } })
-        page.addView(Button(this).apply { text = "Неактивные чаты"; setOnClickListener { startActivity(Intent(this@NativeActivity, InactiveChatsActivity::class.java)) } })
         query = EditText(this).apply { hint = "Поиск сообщений"; setSingleLine(); setTextColor(Color.WHITE); setHintTextColor(Color.LTGRAY) }
         page.addView(query)
         page.addView(Button(this).apply { text = "Искать"; setOnClickListener { search() } })

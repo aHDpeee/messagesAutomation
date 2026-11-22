@@ -11,7 +11,7 @@ internal object FolderImport {
             val id = item["id"].orEmpty()
             require(id.toLongOrNull()?.let { it != 0L } == true) { "Неверный ID чата" }
             val row = byId[id] ?: ChatCatalog.columns.associateWith { "" }.toMutableMap().also {
-                it.putAll(item); it["id"] = id; it["link"] = TelegramLink.refreshed("", "", it["username"].orEmpty()); it["added_via"] = "Telegram folder"; it["added_at"] = java.time.Instant.now().toString(); rows.add(it); byId[id] = it
+                it.putAll(item); it["id"] = id; it["title"] = DialogTitle.choose(it["title"], null, it["username"], id); it["link"] = TelegramLink.refreshed("", "", it["username"].orEmpty()); it["added_via"] = "Telegram folder"; it["added_at"] = java.time.Instant.now().toString(); rows.add(it); byId[id] = it
             }
             if (row["blocks"].isNullOrBlank() || row["blocks"].orEmpty().equals(target, true) || moveConflicts) row["blocks"] = target
         }

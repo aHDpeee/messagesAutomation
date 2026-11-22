@@ -19,6 +19,15 @@ fun main() {
             check("https://t.me/example_group/7" in text)
             check("Author" in text && "\"5\",\"5\"" in text)
         }
+        val withPrompt = File(root, "with-prompt.zip")
+        GroupedArchive.create(withPrompt, listOf(GroupedArchive.Chat("-10", "Group", "Work", "example_group", "group")), { source }, prompts = mapOf("Work" to "Сделай краткую сводку"))
+        ZipFile(withPrompt).use { zip ->
+            val prompt = zip.entries().asSequence().single { it.name.endsWith("/AI_PROMPT.txt") }
+            check(zip.getInputStream(prompt).bufferedReader().readText() == "Сделай краткую сводку")
+        }
+        val rootPrompt = File(root, "root-prompt.zip")
+        GroupedArchive.create(rootPrompt, listOf(GroupedArchive.Chat("-10", "Group", "Ungrouped")), { source }, prompts = mapOf("Ungrouped" to "Промпт"))
+        ZipFile(rootPrompt).use { zip -> check(zip.getEntry("AI_PROMPT.txt") != null) }
         val failed = File(root, "failed.zip")
         runCatching { GroupedArchive.create(failed, listOf(GroupedArchive.Chat("-11", "Other", "Ungrouped")), { source }) }.onSuccess { error("wrong chat accepted") }
         check(!failed.exists())

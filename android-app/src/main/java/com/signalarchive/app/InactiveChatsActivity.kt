@@ -25,7 +25,7 @@ internal object Inactivity {
 }
 
 /** Dates are only as recent as the last dialog synchronization. */
-class InactiveChatsActivity : Activity() {
+class InactiveChatsActivity : BackSwipeActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         Appearance.apply(this)
         super.onCreate(savedInstanceState)
@@ -80,7 +80,7 @@ class InactiveChatsActivity : Activity() {
                 val inactive = rows.filter { it["id"].orEmpty() !in unavailableIds && it["id"].orEmpty() !in unansweredIds && Inactivity.isInactive(it["last_message_date"].orEmpty(), Instant.now(), threshold) }
                 fun section(title: String, list: List<MutableMap<String, String>>) {
                     entries.addView(TextView(this).apply { text = "$title (${list.size})"; textSize = 18f; setPadding(0, 20, 0, 4) })
-                    list.sortedBy { it["title"].orEmpty().lowercase() }.forEach { row ->
+                    list.sortedWith(compareBy<MutableMap<String, String>> { Inactivity.date(it["last_message_date"].orEmpty()) ?: Instant.MAX }.thenBy { it["title"].orEmpty().lowercase() }).forEach { row ->
                         val link = TelegramLink.from(row)
                         entries.addView(TextView(this).apply {
                             text = "${row["title"]} · ${row["last_message_date"].orEmpty().ifBlank { "дата неизвестна" }}" + if (link != null) " ↗" else ""

@@ -1,0 +1,29 @@
+Tegash Non-Commercial Use License
+================================
+
+Copyright (c) 2026 Tegash contributors, for their respective contributions.
+
+Subject to the scope and exceptions below, permission is granted to use,
+study and modify this software for non-commercial purposes, and to reproduce
+and distribute original or modified copies in source or binary form, without
+restriction on the number of copies, recipients, territory or distribution
+medium. Distribution itself may be free of charge or for a fee. Recipients
+receive the same permission to use the covered software non-commercially.
+
+Commercial operation or use of the covered software, including use primarily
+intended for commercial advantage or monetary compensation, requires separate
+permission from the relevant copyright holders. Distributing a copy, including
+charging for the copy or its delivery, is permitted by this license; this does
+not grant permission to operate the software commercially.
+
+Retain this license and applicable copyright notices when distributing copies.
+The software is provided "AS IS", without warranty of any kind, express or
+implied. To the extent permitted by law, copyright holders are not liable for
+claims or damages arising from the software or its use.
+
+Scope and prior rights: this license applies only to material whose copyright
+holders have authorized these terms. It does not revoke permissions previously
+granted under an earlier license. The desktop component remains available under
+the MIT license in desktop/LICENSE; third-party dependencies and separately
+licensed material retain their own licenses. No rights to Telegram trademarks
+or third-party content are granted.

@@ -75,9 +75,11 @@ def create_shortcut(directory: Path, command: list[str]) -> Path:
     path = directory / 'Signal Archive.desktop'
     if path.exists() or path.is_symlink():
         raise FileExistsError(f'Shortcut already exists: {path}')
+    icon = application_directory() / 'assets' / 'icons' / 'tegash.png'
+    icon_line = f'Icon={icon}\n' if icon.is_file() and '\n' not in str(icon) and '\r' not in str(icon) else ''
     contents = ('[Desktop Entry]\nType=Application\nName=Signal Archive\n'
                 'Comment=Open Signal Archive\nTerminal=false\nExec='
-                + ' '.join(_desktop_arg(part) for part in command) + '\n')
+                + ' '.join(_desktop_arg(part) for part in command) + '\n' + icon_line)
     path.write_text(contents, encoding='utf-8')
     path.chmod(0o755)
     return path

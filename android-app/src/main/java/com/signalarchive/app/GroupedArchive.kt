@@ -35,13 +35,14 @@ internal object GroupedArchive {
         val title = safeComponent(chat.title, 60)
         return if (title.isEmpty()) "chat_${chat.id}.csv" else "chat_${chat.id}_${title}.csv"
     }
-    fun create(destination: File, chats: List<Chat>, fetchCsv: (Chat) -> File?, allowEmpty: Boolean = false, progress: (Int, Int, String) -> Unit = { _, _, _ -> }): Result {
+    fun create(destination: File, chats: List<Chat>, fetchCsv: (Chat) -> File?, allowEmpty: Boolean = false, prompts: Map<String, String> = emptyMap(), progress: (Int, Int, String) -> Unit = { _, _, _ -> }): Result {
         require(chats.isNotEmpty()) { "Нет выбранных чатов" }
         require(chats.map { it.id }.toSet().size == chats.size) { "Повторный ID чата" }
         var total = 0; var written = 0
         try {
             destination.outputStream().use { raw ->
                 ZipOutputStream(raw).use { zip ->
+                    val writtenGroups = mutableSetOf<String>()
                     for ((index, chat) in chats.withIndex()) {
                         if (Thread.currentThread().isInterrupted) throw InterruptedException("Экспорт отменён")
                         require(chat.id.matches(Regex("-?[0-9]{1,20}")) && chat.id.toLongOrNull() != null && chat.id.toLong() != 0L) { "Неверный ID чата" }
@@ -75,8 +76,15 @@ internal object GroupedArchive {
                                 line(fields.map { item[it].orEmpty() }); total++
                             }
                             val footer = mapOf("record_type" to "project", "text" to "Exported with Tegash by ahdpeee and Codex. Ideas and contributions welcome. https://github.com/aHDpeee/messagesAutomation")
-                            line(fields.map { footer[it].orEmpty() }); out.flush(); zip.closeEntry(); written++
+                            line(fields.map { footer[it].orEmpty() }); out.flush(); zip.closeEntry(); written++; writtenGroups.add(chat.group)
                         }
+                    }
+                    for (group in writtenGroups) {
+                        val prompt = prompts[group].orEmpty()
+                        if (prompt.isBlank()) continue
+                        val prefix = if (group.equals("Ungrouped", true)) "" else folder(group)
+                        zip.putNextEntry(ZipEntry(prefix + "AI_PROMPT.txt"))
+                        zip.write(prompt.toByteArray(StandardCharsets.UTF_8)); zip.closeEntry()
                     }
                 }
             }

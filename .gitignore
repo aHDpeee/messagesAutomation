@@ -16,6 +16,7 @@ exports/
 *.jsonl
 *.csv
 *.zip
+telegram-folder-icon-assets.zip
 *.pem
 *.key
 *.p12

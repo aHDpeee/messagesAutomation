@@ -22,7 +22,7 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 /** Explicit, user-started export of visible participants, without profile scraping. */
-class MembersExportActivity : Activity() {
+class MembersExportActivity : BackSwipeActivity() {
     private val worker = Executors.newSingleThreadExecutor()
     @Volatile private var destroyed = false
     private lateinit var status: TextView
@@ -50,7 +50,7 @@ class MembersExportActivity : Activity() {
         super.onCreate(savedInstanceState)
         val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
         page.addView(TextView(this).apply { text = "Экспорт участников"; textSize = 24f })
-        page.addView(TextView(this).apply { text = "Telegram может скрывать участников и поля. В ZIP попадут только доступные данные." })
+        page.addView(TextView(this).apply { text = "Telegram может скрывать участников и поля. Для био и личных каналов включите подробности ниже. CSV укажет, были ли данные получены; публичная ссылка появится, если Telegram предоставил username канала." })
         status = TextView(this).apply { text = "Войдите в Telegram и обновите список чатов." }
         page.addView(status)
         progress = ProgressBar(this).apply { visibility = View.GONE }

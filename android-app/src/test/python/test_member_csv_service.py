@@ -77,6 +77,7 @@ class MembersCsvTests(unittest.TestCase):
             with open(result["file_path"], encoding="utf-8-sig", newline="") as stream:
                 row = next(csv.DictReader(stream))
             self.assertEqual((row["bio"], row["personal_channel_id"], row["personal_channel_username"]), ("hello", "42", "news"))
+            self.assertEqual((row["bio_status"], row["personal_channel_status"], row["personal_channel_link"]), ("AVAILABLE", "AVAILABLE", "https://t.me/news"))
 
     def test_flood_wait_is_propagated_without_publishing_partial_csv(self):
         from telethon.errors import FloodWaitError

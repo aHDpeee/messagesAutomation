@@ -288,8 +288,9 @@ class ExportService:
                     os.fsync(archive_stream.fileno())
                 if final_path.exists():
                     raise FileExistsError("An export file already exists for this job.")
-                os.link(archive_part, final_path)
-                archive_part.unlink()
+                # Android app sandboxes can prohibit hard links, even within
+                # their private directory. Each job owns its unique directory.
+                os.replace(archive_part, final_path)
                 part_path.unlink()
                 checkpoint_data["archive_sha256"] = _hash_file(final_path)
                 checkpoint_data["sha256"] = checkpoint_data["archive_sha256"]
@@ -301,8 +302,7 @@ class ExportService:
                 )
             if final_path.exists():
                 raise FileExistsError("An export file already exists for this job.")
-            os.link(part_path, final_path)
-            part_path.unlink()
+            os.replace(part_path, final_path)
             return self._complete_export(
                 job_id, profile.telegram_id, dialog, final_path, manifest_path,
                 checkpoint_data, output_format,

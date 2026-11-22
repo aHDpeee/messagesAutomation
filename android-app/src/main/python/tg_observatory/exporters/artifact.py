@@ -78,8 +78,7 @@ class MarkdownArtifact:
         self._stream.flush()
         os.fsync(self._stream.fileno())
         self._stream.close()
-        os.link(self.part, self.path)
-        self.part.unlink()
+        os.replace(self.part, self.path)
         self._complete = True
         size = self.path.stat().st_size
         digest = self._digest.hexdigest()

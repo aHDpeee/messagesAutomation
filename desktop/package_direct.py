@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 FILES = (
-    "pyproject.toml", "LICENSE", "install_runtime.py", "install-linux.sh",
+    "pyproject.toml", "LICENSE", "install_runtime.py", "install-linux.sh", "assets/icons/tegash.ico", "assets/icons/tegash.png",
     "install-windows.bat", "start-linux.sh", "start-windows.bat",
     "run-linux.sh", "run-windows.bat", "start-existing-session-linux.sh", "start-old-archive-linux.sh",
     "signal_archive/__init__.py", "signal_archive/__main__.py", "signal_archive/cli.py",

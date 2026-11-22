@@ -18,12 +18,13 @@ import android.widget.TextView
 import java.time.LocalTime
 
 /** User chooses a folder before enabling automatic exports. */
-class ScheduleActivity : Activity() {
+class ScheduleActivity : BackSwipeActivity() {
     private lateinit var enabled: CheckBox
     private lateinit var time: EditText
     private lateinit var status: TextView
     private lateinit var retention: CheckBox
     private lateinit var days: EditText
+    private lateinit var email: CheckBox
     private var tree: Uri? = null
     override fun onCreate(savedInstanceState: Bundle?) {
         Appearance.apply(this)
@@ -34,6 +35,12 @@ class ScheduleActivity : Activity() {
         body.addView(TextView(this).apply { text = "Автоматический экспорт"; textSize = 24f })
         body.addView(TextView(this).apply { text = "Раз в день при доступной сети. Android может перенести время запуска; экспорт выполняется в выбранную папку без медиа." })
         enabled = CheckBox(this).apply { text = "Включить ежедневный экспорт"; isChecked = prefs.getBoolean("enabled", false) }; body.addView(enabled)
+        val mailConfigured = runCatching { MailSettings.load(this) != null }.getOrDefault(false)
+        email = CheckBox(this).apply {
+            text = if (mailConfigured) "Отправлять архив на почту" else "Настройте почту, чтобы включить отправку"
+            isEnabled = mailConfigured; isChecked = mailConfigured && prefs.getBoolean("email_enabled", false)
+        }; body.addView(email)
+        body.addView(Button(this).apply { text = "Настроить почту"; setOnClickListener { startActivity(Intent(this@ScheduleActivity, MailSettingsActivity::class.java)) } })
         time = EditText(this).apply { hint = "Время ЧЧ:ММ"; setText(prefs.getString("time", "03:15")); setSingleLine() }; body.addView(time)
         retention = CheckBox(this).apply { text = "Удалять старые автоматические архивы"; isChecked = prefs.getBoolean("retention_enabled", false) }; body.addView(retention)
         days = EditText(this).apply { hint = "Хранить дней"; inputType = InputType.TYPE_CLASS_NUMBER; setText(prefs.getInt("retention_days", 30).toString()); setSingleLine() }; body.addView(days)
@@ -62,7 +69,7 @@ class ScheduleActivity : Activity() {
                     require(contentResolver.persistedUriPermissions.any { it.uri == tree && it.isReadPermission && it.isWritePermission }) { "Доступ к папке потерян. Выберите папку заново." }
                     require(SecureCredentialStore(this@ScheduleActivity).load() != null) { "Сначала подключите Telegram" }
                 }
-                check(prefs.edit().putBoolean("enabled", enabled.isChecked).putString("time", value).putString("tree", tree?.toString()).putBoolean("retention_enabled", retention.isChecked).putInt("retention_days", retentionDays).commit())
+                check(prefs.edit().putBoolean("enabled", enabled.isChecked).putString("time", value).putString("tree", tree?.toString()).putBoolean("retention_enabled", retention.isChecked).putInt("retention_days", retentionDays).putBoolean("email_enabled", email.isChecked).commit())
                 try { ExportSchedule.schedule(this@ScheduleActivity) } catch (error: Exception) {
                     prefs.edit().putBoolean("enabled", false).commit(); throw error
                 }
@@ -82,6 +89,15 @@ class ScheduleActivity : Activity() {
             days.setText(saved.getString("days", days.text.toString()))
         }
         update()
+    }
+    override fun onResume() {
+        super.onResume()
+        if (::email.isInitialized) {
+            val configured = runCatching { MailSettings.load(this) != null }.getOrDefault(false)
+            email.isEnabled = configured
+            email.text = if (configured) "Отправлять архив на почту" else "Настройте почту, чтобы включить отправку"
+            email.isChecked = configured && ExportSchedule.prefs(this).getBoolean("email_enabled", false)
+        }
     }
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
