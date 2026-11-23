@@ -28,4 +28,15 @@
     <style name="AppThemeGreen" parent="AppTheme"><item name="android:colorAccent">#81C995</item></style>
     <style name="AppThemePurple" parent="AppTheme"><item name="android:colorAccent">#CF9FFF</item></style>
     <style name="AppThemePink" parent="AppTheme"><item name="android:colorAccent">#FF91B9</item></style>
+    <style name="ExportDialogTheme" parent="AppTheme">
+        <item name="android:windowIsFloating">true</item>
+        <item name="android:backgroundDimEnabled">true</item>
+        <item name="android:windowBackground">@drawable/dialog_background</item>
+        <item name="android:windowMinWidthMajor">90%</item>
+        <item name="android:windowMinWidthMinor">90%</item>
+    </style>
+    <style name="ExportDialogBlue" parent="ExportDialogTheme"><item name="android:colorAccent">#67B7FF</item></style>
+    <style name="ExportDialogGreen" parent="ExportDialogTheme"><item name="android:colorAccent">#81C995</item></style>
+    <style name="ExportDialogPurple" parent="ExportDialogTheme"><item name="android:colorAccent">#CF9FFF</item></style>
+    <style name="ExportDialogPink" parent="ExportDialogTheme"><item name="android:colorAccent">#FF91B9</item></style>
 </resources>

@@ -27,6 +27,10 @@ internal object Appearance {
         val style = activity.resources.getIdentifier(themes[selected(activity)], "style", activity.packageName)
         if (style != 0) activity.setTheme(style)
     }
+    fun applyExportDialog(activity: Activity) {
+        val styles = intArrayOf(R.style.ExportDialogTheme, R.style.ExportDialogBlue, R.style.ExportDialogGreen, R.style.ExportDialogPurple, R.style.ExportDialogPink)
+        activity.setTheme(styles[selected(activity)])
+    }
     fun save(context: Context, index: Int) {
         require(index in names.indices)
         check(context.getSharedPreferences("appearance", Context.MODE_PRIVATE).edit().putInt("accent", index).remove("custom_accent").commit())

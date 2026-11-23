@@ -43,6 +43,8 @@ class CatalogActivity : BackSwipeActivity() {
     private lateinit var store: ChatCatalog
     private lateinit var rows: MutableList<MutableMap<String, String>>
     private lateinit var list: ListView
+    private lateinit var emptyTitle: TextView
+    private lateinit var emptyHint: TextView
     private var visibleRows: List<MutableMap<String, String>> = emptyList()
     private val chatAdapter = object : BaseAdapter() {
         override fun getCount() = visibleRows.size
@@ -307,7 +309,6 @@ class CatalogActivity : BackSwipeActivity() {
                     search.setSelection(search.text.length)
                 }.setNegativeButton("Отмена", null).show()
         }, LinearLayout.LayoutParams(dp(40), dp(48)))
-        searchLine.addView(icon("+", "Добавить чат по ссылке, имени или ID") { startActivity(Intent(this, TelegramActivity::class.java)) }, LinearLayout.LayoutParams(dp(40), dp(48)))
         page.addView(searchLine)
         page.addView(HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(tabs) })
         list = ListView(this).apply { adapter = chatAdapter }
@@ -318,7 +319,16 @@ class CatalogActivity : BackSwipeActivity() {
             }
         })
         list.setOnTouchListener { _, event -> swipe.onTouchEvent(event); false }
-        page.addView(list, LinearLayout.LayoutParams(-1, 0, 1f))
+        emptyTitle = TextView(this).apply { text = "(U u U)l.."; textSize = 34f; gravity = android.view.Gravity.CENTER; setTextColor(Color.WHITE) }
+        emptyHint = TextView(this).apply { textSize = 15f; gravity = android.view.Gravity.CENTER; setTextColor(Color.LTGRAY); setPadding(dp(30), dp(14), dp(30), 0) }
+        val empty = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = android.view.Gravity.CENTER
+            addView(emptyTitle); addView(emptyHint)
+            setOnTouchListener { _, event -> swipe.onTouchEvent(event); true }
+        }
+        val listArea = FrameLayout(this).apply { addView(list); addView(empty) }
+        list.emptyView = empty
+        page.addView(listArea, LinearLayout.LayoutParams(-1, 0, 1f))
         page.addView(status)
         screenRoot = FrameLayout(this).apply { addView(page, FrameLayout.LayoutParams(-1, -1)) }
         setContentView(screenRoot)
@@ -634,6 +644,13 @@ class CatalogActivity : BackSwipeActivity() {
                 }.setNegativeButton("Отмена", null).show()
         }, LinearLayout.LayoutParams(dp(44), dp(44)))
         val query = search.text.toString().trim()
+        emptyHint.text = when {
+            query.isNotBlank() -> "Ничего не найдено. Попробуйте другой запрос."
+            selectedGroup == allTab -> "Чаты пока не загружены. Обновите список или подключите Telegram."
+            selectedGroup == inactiveTab -> "Неактивных чатов не найдено."
+            selectedGroup == "Ungrouped" -> "Вы можете изменить блок каких-то чатов. А я, если что, тут.. zZZ"
+            else -> "Вы можете изменить блок каких-то чатов или удалить этот блок, а я, если что, тут.. zZZ"
+        }
         val now = java.time.Instant.now()
         val activeDays = getSharedPreferences("catalog_settings", MODE_PRIVATE).getInt("inactive_days", 30).coerceIn(1, 36500)
         val availability = getSharedPreferences("dialog_availability", MODE_PRIVATE)

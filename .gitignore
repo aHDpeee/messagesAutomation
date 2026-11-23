@@ -39,6 +39,7 @@ dist/
 
 # Android, IDE, and operating system output
 .gradle/
+.kotlin/
 local.properties
 .idea/
 .vscode/

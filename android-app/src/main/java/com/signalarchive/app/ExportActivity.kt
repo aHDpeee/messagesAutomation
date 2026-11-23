@@ -61,9 +61,9 @@ class ExportActivity : BackSwipeActivity() {
     private fun dp(value: Int) = (value * resources.displayMetrics.density + .5f).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        Appearance.apply(this)
+        Appearance.applyExportDialog(this)
         super.onCreate(savedInstanceState)
-        val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(28), dp(20), dp(20)); setBackgroundColor(Color.rgb(17,19,21)) }
+        val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(20), dp(20), dp(20)) }
         fun label(value: String, size: Float = 14f) = TextView(this).apply { text = value; textSize = size; setTextColor(Color.WHITE) }
         page.addView(label(if (blockName != null) "Экспорт блока $blockName" else if (singleChatId == null) "Экспорт Telegram" else "Экспорт одного чата", 26f))
         status = label("Период указан в местном часовом поясе. Медиа не скачиваются."); page.addView(status)
@@ -123,7 +123,8 @@ class ExportActivity : BackSwipeActivity() {
         } })
         saveButton = Button(this).apply { text = "Сохранить ZIP"; isEnabled = false; setOnClickListener { saveZip() } }; page.addView(saveButton)
         setContentView(ScrollView(this).apply { addView(page) })
-        SystemInsets.apply(this, findViewById<android.view.ViewGroup>(android.R.id.content).getChildAt(0))
+        window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        setFinishOnTouchOutside(false)
         Appearance.tint(window.decorView, Appearance.color(this))
         savedInstanceState?.let { saved ->
             start.setText(saved.getString("start", start.text.toString())); end.setText(saved.getString("end", end.text.toString()))
@@ -275,6 +276,12 @@ class ExportActivity : BackSwipeActivity() {
         }
     }
     override fun onDestroy() { destroyed = true; worker.shutdownNow(); super.onDestroy() }
+
+    @Deprecated("Back button support")
+    override fun onBackPressed() {
+        if (working || saving) startActivity(Intent(this, CatalogActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
+        else super.onBackPressed()
+    }
 
     private fun selectionFingerprint(ids: List<String>): String =
         java.security.MessageDigest.getInstance("SHA-256").digest(ids.sorted().joinToString(",").toByteArray()).joinToString("") { "%02x".format(it.toInt() and 255) }

@@ -46,7 +46,7 @@ class MembersExportActivity : BackSwipeActivity() {
     private fun ui(action: () -> Unit) = runOnUiThread { if (!destroyed) action() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        Appearance.apply(this)
+        Appearance.applyExportDialog(this)
         super.onCreate(savedInstanceState)
         val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
         page.addView(TextView(this).apply { text = "Экспорт участников"; textSize = 24f })
@@ -82,7 +82,8 @@ class MembersExportActivity : BackSwipeActivity() {
             }
         } catch (error: Exception) { status.text = "Не удалось прочитать каталог: ${error.message}" }
         setContentView(ScrollView(this).apply { addView(page) })
-        SystemInsets.apply(this, findViewById<android.view.ViewGroup>(android.R.id.content).getChildAt(0))
+        window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        setFinishOnTouchOutside(false)
         Appearance.tint(window.decorView, Appearance.color(this))
         savedInstanceState?.let { saved ->
             profiles.isChecked = saved.getBoolean("profiles", profiles.isChecked)
@@ -216,4 +217,9 @@ class MembersExportActivity : BackSwipeActivity() {
     }
 
     override fun onDestroy() { destroyed = true; worker.shutdownNow(); super.onDestroy() }
+    @Deprecated("Back button support")
+    override fun onBackPressed() {
+        if (working || saving) startActivity(Intent(this, CatalogActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
+        else super.onBackPressed()
+    }
 }
